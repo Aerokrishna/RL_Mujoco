@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mujoco_rl_bed"
+version = "0.1.0"
+description = "Modular torque-controlled Franka simulation framework in MuJoCo for RL and diffusion policies."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "mujoco>=3.10",
+    "gymnasium>=1.0",
+    "stable-baselines3>=2.3",
+    "torch>=2.0",
+    "sb3-contrib>=2.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7"]
+
+[tool.setuptools.packages.find]
+# Core framework in src/, research projects (e.g. projects/forge -> `import forge`) in projects/.
+where = ["src", "projects"]
+include = ["mujoco_rl_bed*", "forge*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests", "projects"]
+# ROS (e.g. /opt/ros/humble on PYTHONPATH) registers pytest plugins that break under pytest >= 8.
+addopts = "-p no:launch_testing -p no:launch_ros -p no:ament_lint -p no:ament_copyright -p no:ament_xmllint -p no:ament_flake8 -p no:ament_pep257"

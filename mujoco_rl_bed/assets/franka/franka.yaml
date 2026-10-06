@@ -1,0 +1,55 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Robot configuration for CyRo simulation framework.
+#
+# WHAT YOU SPECIFY HERE
+#   scene_xml_path        – MJCF scene file, relative to this config file
+#   robot_xml_path        – MJCF robot-only file included by the scene
+#   arms.<id>.start_body  – first body of the arm's kinematic chain
+#   arms.<id>.ee_site     – MuJoCo site name at the end-effector
+#   arms.<id>.q_home      – home joint configuration [rad]
+#   arms.<id>.wrench_force_sensor  / wrench_torque_sensor  (optional)
+#
+# WHAT IS AUTO-DERIVED FROM THE MJCF
+#   joint_names    – every hinge/slide joint on the chain start_body→ee_body
+#   actuator_names – position actuators driving those joints (matched by joint)
+#   q_lo / q_hi   – joint range limits read from <joint range="…"/>
+#   base_world     – world-frame origin of start_body (from mj_forward at q=0)
+#
+# AUXILIARY ACTUATORS (optional)
+#   grippers: left/right gripper actuator names (position actuators)
+#   gripper_open, gripper_closed: joint positions [rad] for open/closed
+#   stereo_left_yaw_motor, stereo_right_yaw_motor: camera yaw actuators
+#
+# SWAPPING IN A DIFFERENT ROBOT
+#   1. Write a new MJCF file.
+#   2. Edit scene_xml_path / robot_xml_path and the three arm blocks below.
+#   3. Adjust gripper/camera actuator names if different.
+# ─────────────────────────────────────────────────────────────────────────────
+
+scene_xml_path: scene.xml
+robot_xml_path: panda.xml
+
+# Gripper: position actuators for DH AG145
+grippers:
+  left:  left_robot_gripper_finger1_joint_motor
+  # right: right_robot_gripper_finger1_joint_motor
+gripper_closed: 0.0      # [rad]
+gripper_open:   -0.65    # [rad]
+
+# Stereo camera yaw actuator names
+stereo_left_yaw_motor:  null
+stereo_right_yaw_motor: null
+
+arms:
+  left:
+    start_body:           link0
+    ee_site:              attachment_site
+    wrench_force_sensor:  null
+    wrench_torque_sensor: null
+    q_home: [0.0,
+            -0.78539816,
+                0.0,
+            -2.35619449,
+                0.0,
+                1.57079633,
+                0.78539816]

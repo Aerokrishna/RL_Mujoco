@@ -1,0 +1,9 @@
+# Editor state
+.vscode/
+# Separate clone of the TacDiffusion repo (own .git, ~1.4 GB dataset): clone it separately
+diffusion/
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/

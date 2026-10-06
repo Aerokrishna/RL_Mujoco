@@ -1,0 +1,6 @@
+runs/
+assets/generated/
+__pycache__/
+*.egg-info/
+.pytest_cache/
+MUJOCO_LOG.TXT
