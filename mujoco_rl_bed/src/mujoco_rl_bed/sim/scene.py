@@ -277,10 +277,12 @@ class SceneBuilder:
         cfg = self.cfg
         pairs: list[tuple[int, int]] = []  # (joint id, actuator id)
         for a in range(model.nu):
-            if model.actuator_trntype[a] != mujoco.mjtTrn.mjTRN_JOINT:
+            # Compare as plain ints: from MuJoCo 3.15, mjt* enums no longer compare equal to numpy ints
+            # in all forms (e.g. `np.int32 in (enum, ...)` is False), which silently broke detection.
+            if int(model.actuator_trntype[a]) != int(mujoco.mjtTrn.mjTRN_JOINT):
                 continue
             j = int(model.actuator_trnid[a, 0])
-            if model.jnt_type[j] == mujoco.mjtJoint.mjJNT_HINGE:
+            if int(model.jnt_type[j]) == int(mujoco.mjtJoint.mjJNT_HINGE):
                 pairs.append((j, a))
         pairs.sort()
         jnames = [mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, j) for j, _ in pairs]
@@ -419,7 +421,7 @@ class SceneBuilder:
         arm_jset = set(jids)
         fingers = [j for j in range(model.njnt)
                    if j not in arm_jset and _is_descendant(model, int(model.jnt_bodyid[j]), ee_id)
-                   and model.jnt_type[j] in (mujoco.mjtJoint.mjJNT_SLIDE, mujoco.mjtJoint.mjJNT_HINGE)]
+                   and int(model.jnt_type[j]) in (int(mujoco.mjtJoint.mjJNT_SLIDE), int(mujoco.mjtJoint.mjJNT_HINGE))]
 
         def sensor_slice(name: str) -> slice:
             sid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_SENSOR, name)
