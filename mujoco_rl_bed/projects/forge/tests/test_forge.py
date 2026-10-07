@@ -187,3 +187,27 @@ def test_applied_action_and_action_rate_penalty() -> None:
     w = env.cfg.task.rewards["action_rate"].weight
     assert env.reward_mgr._sums[i] == pytest.approx(w * (4.0 + 0.0 + 0.0 + 4.0), abs=1e-6)  # ||-a1 - a1||^2 = 8
     assert 0.0 < alpha < 1.0
+
+
+def test_controller_randomization() -> None:
+    """Kp and λ are resampled each episode within the paper's ranges, applied, and visible to the critic only."""
+    env = make_env("forge_peg", {"obs_mode": "asymmetric"})
+    st = env.ctx.state["forge"]
+    seen = []
+    for seed in range(5):
+        obs, _ = env.reset(seed=seed)
+        c = env.controller
+        assert 400.0 <= st.kp <= 800.0 and 0.016 <= st.lam <= 0.025
+        np.testing.assert_allclose(c.kp[:3], st.kp)                       # applied by the controller reset
+        np.testing.assert_allclose(c.kd[:3], 2.0 * np.sqrt(st.kp))         # critical damping follows
+        assert env.ctx.state["action_max_step"][0] == st.lam               # λ used by the action term
+        crit = obs[env.policy_obs_dim:]
+        lay = dict(env.obs_mgr.layout["critic"])
+        np.testing.assert_allclose(crit[lay["controller_params_gt"]], [st.kp, st.lam], rtol=1e-5)
+        assert "controller_params_gt" not in dict(env.obs_mgr.layout["policy"])
+        seen.append(st.kp)
+    assert np.ptp(seen) > 50.0  # actually varies between episodes
+    env.ctx.state["action_max_step"][0] = st.lam
+    ee = env.plant.ee_pos.copy()
+    env.action_mgr.apply(np.array([1.0, 1.0, 1.0, -1.0], dtype=np.float32))
+    assert np.all(np.abs(env.controller.pos_d - ee) <= st.lam + 1e-9)  # clip uses the sampled λ

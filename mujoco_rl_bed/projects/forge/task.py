@@ -10,8 +10,9 @@ Values follow the paper's Table II (8 mm peg) unless noted:
   + (U±2 cm, U±2 cm, U[3.7, 5.7] cm), gripper pointing down (IK).
 - Action: 3D TCP target = anchor + a * 5 cm, where the anchor is the TCP pose with the peg tip at
   the (estimated) hole opening (zero action = peg tip at the opening). Clipped per axis to
-  within λ = 2 cm of the TCP (Eq. 5). Kp = 600 N/m (constant, mid of [400, 800]),
-  Kd = 2 sqrt(Kp). Orientation held.
+  within λ of the TCP (Eq. 5). Controller randomization per episode (paper Table II):
+  Kp ~ U[400, 800] N/m (x, y, z), Kd = 2 sqrt(Kp), λ ~ U[1.6, 2.5] cm; the critic observes them,
+  the actor does not. Orientation held.
 - Observation (symmetric default: actor and critic see the same vector; with `asymmetric=true` the
   critic additionally gets the true peg-tip offset and the hole-estimate error, as in the paper):
   peg-tip pos rel. hole opening (3, via the anchor), TCP quat rel. nominal gripper-down pose (4), TCP twist (6), contact force (3, step mean),
@@ -24,8 +25,8 @@ Values follow the paper's Table II (8 mm peg) unless noted:
   only when enabled (evaluation).
 - Episode: 150 policy steps (paper's step count; 7.5 s at 20 Hz). No early termination in training;
   `is_success` reports success at the final step and `ever_success` at any step.
-- Not yet: EE/force observation noise (the hooks exist, set to 0), dynamics randomization (Kp, λ,
-  friction, dead zone). Hole-position noise is opt-in via task.events.reset_fixed.params.pos_noise_std.
+- Not yet: EE/force observation noise (the hooks exist, set to 0), part friction/mass randomization,
+  force dead zone. Hole-position noise is opt-in via task.events.reset_fixed.params.pos_noise_std.
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ POLICY_TERMS = ["ee_pos_rel_anchor", "ee_quat_rel_nominal", "ee_vel", "contact_f
 # position, the actor's other (currently noise-free) terms, the hole-estimate error (explains what the
 # actor believes) and the true success label. The critic does not see the actor block.
 CRITIC_TERMS = ["peg_tip_rel_hole_gt", "ee_quat_rel_nominal", "ee_vel", "contact_force", "force_threshold",
-                "last_action", "anchor_error_gt", "success_gt"]
+                "last_action", "anchor_error_gt", "success_gt", "controller_params_gt"]
 
 
 @register_task("forge_peg")
@@ -99,6 +100,10 @@ def forge_peg() -> TaskCfg:
                                             params={"lo": 5.0, "hi": 10.0}),
             "reset_ee": EventTermCfg(mode="reset", func="forge_reset_ee",
                                      params={"xy_range": 0.02, "z_range": (0.037, 0.057)}),
+            # Controller randomization (paper Table II): Kp ~ U[400, 800] N/m, λ ~ U[1.6, 2.5] cm.
+            # Disable with task.events.randomize_controller.params.kp_range=(600,600) and lam_range=(0.02,0.02).
+            "randomize_controller": EventTermCfg(mode="reset", func="forge_randomize_controller",
+                                                 params={"kp_range": (400.0, 800.0), "lam_range": (0.016, 0.025)}),
             "update": EventTermCfg(mode="step", func="forge_update"),
         },
         episode_length_s=7.5,

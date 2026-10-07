@@ -41,5 +41,8 @@ PPO / recurrent PPO, symmetric or asymmetric actor-critic (`asymmetric=true`: cl
 Additions not in the paper: action smoothing (EMA, alpha 0.2) and an action-rate penalty against
 jitter; success-prediction weight 0.1 (an untrained predictor at weight 1 cancels the success bonus).
 
-Not yet: EE/force observation noise (hooks exist, default 0), dynamics randomization (Kp, λ,
-friction, dead zone), in-hand peg offset.
+Controller randomization (Table II): Kp ~ U[400, 800] N/m and λ ~ U[1.6, 2.5] cm per episode,
+observed only by the critic.
+
+Not yet: EE/force observation noise (hooks exist, default 0), part friction/mass randomization,
+force dead zone, in-hand peg offset.

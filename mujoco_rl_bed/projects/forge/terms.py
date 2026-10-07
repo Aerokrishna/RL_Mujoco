@@ -15,8 +15,11 @@ Implemented from the paper:
   (off during training, as in the paper; enable for evaluation), and the paper's
   early-termination metrics.
 
-Not yet implemented: EE/force observation noise (the hooks exist, default 0), dynamics
-randomization (gains, λ, friction, dead zone).
+- controller randomization (Sec. III-B): per episode Kp (translational) ~ U[400, 800] N/m with
+  Kd = 2 sqrt(Kp), and λ ~ U[1.6, 2.5] cm; not observed by the actor, given to the critic.
+
+Not yet implemented: EE/force observation noise (the hooks exist, default 0), part friction /
+mass randomization, force dead zone.
 
 Shared per-step state lives in a `ForgeState` (in `ctx.state["forge"]`). It is
 updated once per policy step by the `forge_update` step event, so the rewards,
@@ -138,6 +141,9 @@ class ForgeState:
         self.place_xy = place_xy
         self.success_dist = success_dist
         self.p_term = float(p_term)
+        # Controller parameters of the episode (overwritten by forge_randomize_controller if enabled).
+        self.kp = float(ctx.controller.kp_nominal[0])
+        self.lam = float(ctx.buffer("action_max_step", 1)[0])
         self.pred = ctx.buffer("pred_success", 1)
         self.first_pred_step = -1
         self.pred_correct = False
@@ -263,6 +269,8 @@ class ForgeState:
             "et_delay": ((self.first_pred_step - self.first_success_step) * ctx.policy_dt
                          if self.first_pred_step >= 0 and self.pred_correct and self.first_success_step >= 0 else -1.0),
             "pred_success_final": float(self.pred[0]),
+            "ctrl_kp": self.kp,
+            "ctrl_lambda": self.lam,
         }
 
 
@@ -354,6 +362,30 @@ def forge_sample_threshold(ctx: "Context", lo: float = 5.0, hi: float = 10.0) ->
     _st(ctx).f_th = float(ctx.rng.uniform(lo, hi))
 
 
+@event_term("forge_randomize_controller")
+def forge_randomize_controller(ctx: "Context", kp_range: tuple[float, float] = (400.0, 800.0),
+                               lam_range: tuple[float, float] = (0.016, 0.025)) -> None:
+    """Reset: sample the controller's translational stiffness Kp and the action clip λ (paper Table II).
+
+    One Kp is drawn for x, y and z (rotational gains unchanged); Kd follows as 2 sqrt(Kp) when the
+    controller uses automatic damping. Runs before the controller reset, which applies the nominal gains.
+    The maximum commandable force is λ * Kp (paper: 6.4 to 20 N).
+
+    Args:
+        ctx: Context.
+        kp_range: Translational stiffness range [N/m].
+        lam_range: λ range [m].
+    """
+    st = _st(ctx)
+    c = ctx.controller
+    st.kp = float(ctx.rng.uniform(*kp_range))
+    st.lam = float(ctx.rng.uniform(*lam_range))
+    c.kp_nominal[:3] = st.kp
+    if getattr(c, "auto_kd", False):
+        c.kd_nominal[:3] = 2.0 * np.sqrt(st.kp)
+    ctx.buffer("action_max_step", 1)[0] = st.lam
+
+
 @event_term("forge_update")
 def forge_update(ctx: "Context") -> None:
     """Step: recompute the shared per-step quantities (run as a `step` event)."""
@@ -415,6 +447,14 @@ def anchor_error_gt(ctx: "Context", out: np.ndarray) -> None:
     st = _st(ctx)
     np.subtract(st.anchor, st.hole_tip, out=out)
     out[2] -= st.tcp_to_tip  # anchor = hole tip estimate + (0, 0, tcp_to_tip)
+
+
+@obs_term("controller_params_gt", dim=2)
+def controller_params_gt(ctx: "Context", out: np.ndarray) -> None:
+    """Privileged: this episode's [Kp (translational) [N/m], λ [m]], shape (2,)."""
+    st = _st(ctx)
+    out[0] = st.kp
+    out[1] = st.lam
 
 
 @obs_term("success_gt", dim=1)

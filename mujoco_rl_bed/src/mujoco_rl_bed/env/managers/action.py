@@ -264,7 +264,8 @@ class AnchorRelativePos(ActionTerm):
         p_targ = clip(anchor + a * anchor_bounds, p_ee - λ, p_ee + λ)
 
     The anchor is read from `ctx.state[cfg.anchor]` (written by reset events, e.g. the
-    noisy hole-tip estimate). The target is also clipped to the workspace box. Orientation
+    noisy hole-tip estimate). λ is read from `ctx.state["action_max_step"]` (initialized to
+    `cfg.max_step`; events may randomize it). The target is also clipped to the workspace box. Orientation
     is held at the reset orientation.
 
     With `cfg.success_prediction`, a 4th dim a_ET is mapped to p = (a_ET + 1) / 2 and stored in
@@ -287,7 +288,9 @@ class AnchorRelativePos(ActionTerm):
         self.dim = 4 if self.predict else 3
         self._pred = ctx.buffer("pred_success", 1)
         self._bounds = np.asarray(cfg.anchor_bounds, dtype=np.float64)
-        self._lam = float(cfg.max_step)
+        # λ lives in a state buffer so reset events can randomize it per episode (FORGE DR).
+        self._lam_buf = ctx.buffer("action_max_step", 1)
+        self._lam_buf[0] = float(cfg.max_step)
         self._lo = np.asarray(cfg.pos_lo, dtype=np.float64)
         self._hi = np.asarray(cfg.pos_hi, dtype=np.float64)
         self._anchor = ctx.buffer(cfg.anchor, 3)
@@ -319,8 +322,9 @@ class AnchorRelativePos(ActionTerm):
             np.copyto(self._smooth, a[:3])
         np.multiply(self._smooth, self._bounds, out=self._pos)
         np.add(self._pos, self._anchor, out=self._pos)
-        np.subtract(ee, self._lam, out=self._tmp_lo)
-        np.add(ee, self._lam, out=self._tmp_hi)
+        lam = self._lam_buf[0]
+        np.subtract(ee, lam, out=self._tmp_lo)
+        np.add(ee, lam, out=self._tmp_hi)
         np.clip(self._pos, self._tmp_lo, self._tmp_hi, out=self._pos)   # within λ of the EE
         np.clip(self._pos, self._lo, self._hi, out=self._pos)           # workspace box
         self.ctx.controller.set_target(pos=self._pos, quat=self._quat)
