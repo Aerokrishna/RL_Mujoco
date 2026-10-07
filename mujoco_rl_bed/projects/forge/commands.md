@@ -93,6 +93,23 @@ python projects/forge/train.py algo=recurrent_ppo asymmetric=true device=cuda n_
 - Run it detached so it survives closing the terminal:
   `setsid -f python projects/forge/train.py ... > projects/forge/runs/gpu_run.log 2>&1 < /dev/null`
 
+## 2d. Continue training a finished run (`init_from`)
+
+Starts from a run's trained weights, optimizer state and observation-normalization statistics
+instead of a fresh network. The new run gets its own folder and counts `total_timesteps` from 0.
+Use the source run's network settings (`algo`, `asymmetric`, `net_arch`, LSTM size); training
+hyperparameters (`n_steps`, `batch_size`, learning rate) and task overrides may change.
+`log_std_init` is ignored (the trained std is loaded).
+
+```bash
+python projects/forge/train.py algo=recurrent_ppo asymmetric=true device=cpu \
+    n_envs=24 n_steps=128 batch_size=768 total_timesteps=5000000 \
+    task.events.reset_fixed.params.pos_noise_std=0.001 \
+    init_from=<source_run_folder> run_name=ft
+# from a specific checkpoint instead of final_model.zip:
+#   init_from=<source_run_folder> init_checkpoint=checkpoints/model_3000000_steps.zip
+```
+
 ## 3. TensorBoard
 
 ```bash
@@ -212,6 +229,8 @@ python scripts/view_scene.py headless=true duration=5   # no window, prints drif
 | `checkpoint_every` | `100000` | Env steps between checkpoints |
 | `run_root` | `projects/forge/runs` | Where run folders are created |
 | `run_name` | `""` | Suffix appended to the run folder name |
+| `init_from` | `""` | Run to continue from (folder name in `run_root` or a path): loads its weights, optimizer state and VecNormalize statistics (section 2d) |
+| `init_checkpoint` | `""` | Model zip inside `init_from` (default `final_model.zip`), e.g. `checkpoints/model_3000000_steps.zip` |
 | `verbose` | `1` | SB3 console output (0 = quiet) |
 
 ## Evaluation arguments (`eval.py`)

@@ -15,6 +15,11 @@ Each run writes <run_root>/<task>_<YYYYmmdd-HHMMSS>_s<seed>/ with:
     tb/                TensorBoard logs (SB3 scalars + episode/* task metrics)
     checkpoints/       periodic model_<steps>_steps.zip (+ model_vecnormalize_<steps>_steps.pkl)
     final_model.zip, vecnormalize.pkl
+
+Fine-tuning: `init_from=<run>` starts from that run's trained weights (policy, value function,
+optimizer state) and VecNormalize statistics instead of a fresh network, e.g. to continue a
+finished run with more steps or harder settings. The new run gets its own folder and counts
+`total_timesteps` from zero; the network settings (algo, asymmetric, net_arch, LSTM) must match.
 """
 
 from __future__ import annotations
@@ -22,6 +27,7 @@ from __future__ import annotations
 import dataclasses
 import importlib
 import json
+import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -80,6 +86,10 @@ class TrainCfg:
         checkpoint_every: Save a checkpoint every this many env steps.
         run_root: Directory holding run folders (relative paths are relative to the repository root).
         run_name: Optional suffix for the run folder.
+        init_from: Run to initialize from (folder name in `run_root`, or a path): its weights, optimizer
+            state and VecNormalize statistics are loaded before training. Empty = train from scratch.
+        init_checkpoint: Model zip inside `init_from` (default final_model.zip), e.g.
+            checkpoints/model_3000000_steps.zip (the matching VecNormalize file is used).
         verbose: SB3 verbosity.
     """
 
@@ -112,6 +122,8 @@ class TrainCfg:
     checkpoint_every: int = 100_000
     run_root: str = "runs"
     run_name: str = ""
+    init_from: str = ""
+    init_checkpoint: str = ""
     verbose: int = 1
 
 
@@ -165,6 +177,39 @@ def build_model(cfg: TrainCfg, venv, tb_dir: Path, actor_dim: int | None = None)
     raise ValueError(f"unknown algo '{cfg.algo}' (ppo | recurrent_ppo)")
 
 
+# TrainCfg fields that define the network; they must match the run given by `init_from`.
+_ARCH_FIELDS = ("algo", "asymmetric", "net_arch", "lstm_hidden_size", "n_lstm_layers")
+
+
+def resolve_init(cfg: TrainCfg, run_root: Path) -> tuple[Path, Path | None]:
+    """Locate the model zip and VecNormalize statistics of `cfg.init_from` and check the network matches.
+
+    Args:
+        cfg: Training config (`init_from` set).
+        run_root: Absolute run root, searched for `init_from` by folder name.
+
+    Returns:
+        (model zip, VecNormalize pickle or None when the source run has none).
+    """
+    from mujoco_rl_bed.rl.evaluate import _find_run
+
+    src = _find_run(cfg.init_from, str(run_root))
+    conf = json.loads((src / "config.json").read_text())["train"]
+    mine = to_jsonable(cfg)
+    diff = [f"{k}: {conf.get(k)} (init_from) vs {mine[k]} (now)" for k in _ARCH_FIELDS if conf.get(k) != mine[k]]
+    if diff:
+        raise ValueError("init_from network mismatch; use the source run's settings:\n  " + "\n  ".join(diff))
+    ckpt = Path(cfg.init_checkpoint) if cfg.init_checkpoint else Path("final_model.zip")
+    ckpt = ckpt if ckpt.is_absolute() else src / ckpt
+    if not ckpt.exists():
+        raise FileNotFoundError(f"init_from checkpoint not found: {ckpt}")
+    vn = src / "vecnormalize.pkl"
+    m = re.search(r"model_(\d+)_steps\.zip$", ckpt.name)
+    if m:
+        vn = ckpt.parent / f"model_vecnormalize_{m.group(1)}_steps.pkl"
+    return ckpt, (vn if vn.exists() else None)
+
+
 def import_task_modules(modules: Sequence[str]) -> None:
     """Import packages whose import registers tasks/terms (e.g. "forge").
 
@@ -206,20 +251,34 @@ def main(argv: list[str], task_modules: Sequence[str] = (), defaults: dict[str, 
     root = Path(cfg.run_root)
     if not root.is_absolute():
         root = PROJECT_ROOT / root
+    init_ckpt, init_vn = resolve_init(cfg, root) if cfg.init_from else (None, None)
+    if init_ckpt is not None and (cfg.normalize_obs or cfg.normalize_reward) and init_vn is None:
+        raise FileNotFoundError(f"init_from: no VecNormalize statistics next to {init_ckpt}")
     stamp = time.strftime("%Y%m%d-%H%M%S")
     run_dir = root / f"{cfg.task}_{stamp}_s{cfg.seed}{'_' + cfg.run_name if cfg.run_name else ''}"
     (run_dir / "checkpoints").mkdir(parents=True, exist_ok=False)
     (run_dir / "config.json").write_text(json.dumps({
         "train": to_jsonable(cfg), "env": to_jsonable(env_cfg),
         "env_overrides": env_ov, "argv": argv, "task_modules": list(task_modules),
+        "init_from": {"model": str(init_ckpt), "vecnormalize": str(init_vn)} if init_ckpt else None,
     }, indent=2))
 
     venv = make_vec_env(cfg.task, cfg.n_envs, cfg.seed, env_ov, vec=cfg.vec, task_modules=task_modules)
     if cfg.normalize_obs or cfg.normalize_reward:
-        venv = VecNormalize(venv, norm_obs=cfg.normalize_obs, norm_reward=cfg.normalize_reward, gamma=cfg.gamma)
+        if init_vn is not None:
+            # Keep the source run's running statistics (the loaded network expects them) and keep updating them.
+            venv = VecNormalize.load(str(init_vn), venv)
+            venv.training = True
+            venv.norm_obs, venv.norm_reward = cfg.normalize_obs, cfg.normalize_reward
+        else:
+            venv = VecNormalize(venv, norm_obs=cfg.normalize_obs, norm_reward=cfg.normalize_reward, gamma=cfg.gamma)
 
     actor_dim = venv.get_attr("policy_obs_dim", indices=[0])[0]
     model = build_model(cfg, venv, run_dir / "tb", actor_dim=actor_dim)
+    if init_ckpt is not None:
+        # Weights + optimizer state; hyperparameters (n_steps, learning rate, ...) come from this run's cfg.
+        model.set_parameters(str(init_ckpt), exact_match=True, device=model.device)
+        print(f"[train] initialized from {init_ckpt} (vecnormalize: {init_vn})")
     callbacks = CallbackList([
         EpisodeInfoCallback(),
         CheckpointCallback(save_freq=max(1, cfg.checkpoint_every // cfg.n_envs), save_path=str(run_dir / "checkpoints"),
