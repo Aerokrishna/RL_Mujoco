@@ -5,7 +5,8 @@ Usage (from anywhere, `dqn` env active):
     python projects/forge/eval.py run=<run_dir> checkpoint=checkpoints/model_500000_steps.zip render=true
     python projects/forge/eval.py policy=scripted episodes=10 render=true
 
-`run` may be a folder name inside `projects/forge/runs/`, or any path.
+`run` may be a folder name inside `projects/forge/runs/`, or any path. `policy=scripted` runs with the
+dynamics randomization and observation noise off (`forge.task.NO_DR`).
 Reports success (final step / any step), time to success, mean/max contact force.
 """
 
@@ -35,4 +36,9 @@ def scripted_factory(env):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:], task_modules=("forge",), defaults=DEFAULTS, scripted_factory=scripted_factory)
+    defaults = dict(DEFAULTS)
+    if "policy=scripted" in sys.argv[1:]:
+        from forge.task import NO_DR
+
+        defaults.update(NO_DR)  # the expert cannot compensate the dead zone (CLI overrides still win)
+    main(sys.argv[1:], task_modules=("forge",), defaults=defaults, scripted_factory=scripted_factory)

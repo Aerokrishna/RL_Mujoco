@@ -261,19 +261,23 @@ class DeltaJointPos(ActionTerm):
 class AnchorRelativePos(ActionTerm):
     """FORGE action (paper Eq. 5), position only.
 
-        p_targ = clip(anchor + a * anchor_bounds, p_ee - λ, p_ee + λ)
+        p_targ = clip(anchor + s * anchor_bounds, p_ee - λ, p_ee + λ)
 
     The anchor is read from `ctx.state[cfg.anchor]` (written by reset events, e.g. the
-    noisy hole-tip estimate). λ is read from `ctx.state["action_max_step"]` (initialized to
-    `cfg.max_step`; events may randomize it). The target is also clipped to the workspace box. Orientation
-    is held at the reset orientation.
+    noisy hole-tip estimate). λ is read from `ctx.state["action_max_step"]`, shape (3,), per axis
+    (initialized to `cfg.max_step`; events may randomize it). The target is also clipped to the
+    workspace box. Orientation is held at the reset orientation.
+
+    Smoothing: s_t = alpha * a_t + (1 - alpha) * s_{t-1}, starting from the action that holds the
+    reset pose. alpha is read from `ctx.state["action_ema"]` (initialized to `cfg.ema_factor`; events
+    may randomize it per episode, as Isaac Lab FORGE does). 1.0 = no smoothing.
 
     With `cfg.success_prediction`, a 4th dim a_ET is mapped to p = (a_ET + 1) / 2 and stored in
-    `ctx.state["pred_success"][0]` (it does not affect the controller).
+    `ctx.state["pred_success"][0]` (it does not affect the controller). With `cfg.ema_prediction`
+    a_ET is smoothed too (Isaac Lab smooths all action dims) and starts at -1 (p = 0) each episode.
 
-    With `cfg.ema_factor` = alpha < 1, the position part is smoothed before use:
-    s_t = alpha * a_t + (1 - alpha) * s_{t-1}, starting from the action that holds the reset pose.
-    The success prediction is not smoothed.
+    `ctx.state["action_target_delta"]` (3,) holds the unclipped target minus the TCP position of the
+    last step (Isaac Lab's `delta_pos`, used by its action penalty).
     """
 
     def __init__(self, cfg: ActionCfg, ctx: "Context") -> None:
@@ -286,11 +290,17 @@ class AnchorRelativePos(ActionTerm):
         super().__init__(cfg, ctx)
         self.predict = bool(cfg.success_prediction)
         self.dim = 4 if self.predict else 3
+        self._n_smooth = self.dim if (self.predict and cfg.ema_prediction) else 3
         self._pred = ctx.buffer("pred_success", 1)
         self._bounds = np.asarray(cfg.anchor_bounds, dtype=np.float64)
-        # λ lives in a state buffer so reset events can randomize it per episode (FORGE DR).
-        self._lam_buf = ctx.buffer("action_max_step", 1)
-        self._lam_buf[0] = float(cfg.max_step)
+        # λ and alpha live in state buffers so reset events can randomize them per episode (FORGE DR).
+        self._lam = ctx.buffer("action_max_step", 3)
+        self._lam[:] = float(cfg.max_step)
+        self._ema = ctx.buffer("action_ema", 1)
+        self._ema[0] = float(cfg.ema_factor)
+        if not 0.0 < self._ema[0] <= 1.0:
+            raise ValueError(f"ema_factor must be in (0, 1], got {self._ema[0]}")
+        self._delta = ctx.buffer("action_target_delta", 3)
         self._lo = np.asarray(cfg.pos_lo, dtype=np.float64)
         self._hi = np.asarray(cfg.pos_hi, dtype=np.float64)
         self._anchor = ctx.buffer(cfg.anchor, 3)
@@ -298,11 +308,8 @@ class AnchorRelativePos(ActionTerm):
         self._tmp_lo = np.zeros(3)
         self._tmp_hi = np.zeros(3)
         self._quat = np.array([1.0, 0, 0, 0])
-        self._alpha = float(cfg.ema_factor)
-        if not 0.0 < self._alpha <= 1.0:
-            raise ValueError(f"ema_factor must be in (0, 1], got {self._alpha}")
-        self._smooth = np.zeros(3)   # smoothed position action s_t
-        self._tmp3 = np.zeros(3)
+        self._smooth = np.zeros(self.dim)   # smoothed action s_t (only the first `_n_smooth` dims are used)
+        self._tmp = np.zeros(self.dim)
 
     def apply(self, a: np.ndarray) -> None:
         """Set the controller position target.
@@ -311,21 +318,23 @@ class AnchorRelativePos(ActionTerm):
             a: Clipped action in [-1, 1], shape (3,) or (4,) with success prediction.
         """
         ee = self.ctx.plant.ee_pos
-        if self.predict:
-            self._pred[0] = 0.5 * (a[3] + 1.0)
-        if self._alpha < 1.0:
+        n = self._n_smooth
+        alpha = float(self._ema[0])
+        if alpha < 1.0:
             # s_t = alpha * a_t + (1 - alpha) * s_{t-1}
-            np.multiply(a[:3], self._alpha, out=self._tmp3)
-            self._smooth *= (1.0 - self._alpha)
-            self._smooth += self._tmp3
+            np.multiply(a[:n], alpha, out=self._tmp[:n])
+            self._smooth[:n] *= (1.0 - alpha)
+            self._smooth[:n] += self._tmp[:n]
         else:
-            np.copyto(self._smooth, a[:3])
-        np.multiply(self._smooth, self._bounds, out=self._pos)
+            np.copyto(self._smooth[:n], a[:n])
+        if self.predict:
+            self._pred[0] = 0.5 * ((self._smooth[3] if n == 4 else a[3]) + 1.0)
+        np.multiply(self._smooth[:3], self._bounds, out=self._pos)
         np.add(self._pos, self._anchor, out=self._pos)
-        lam = self._lam_buf[0]
-        np.subtract(ee, lam, out=self._tmp_lo)
-        np.add(ee, lam, out=self._tmp_hi)
-        np.clip(self._pos, self._tmp_lo, self._tmp_hi, out=self._pos)   # within λ of the EE
+        np.subtract(self._pos, ee, out=self._delta)
+        np.subtract(ee, self._lam, out=self._tmp_lo)
+        np.add(ee, self._lam, out=self._tmp_hi)
+        np.clip(self._pos, self._tmp_lo, self._tmp_hi, out=self._pos)   # within λ of the EE (per axis)
         np.clip(self._pos, self._lo, self._hi, out=self._pos)           # workspace box
         self.ctx.controller.set_target(pos=self._pos, quat=self._quat)
 
@@ -333,20 +342,23 @@ class AnchorRelativePos(ActionTerm):
         """Hold the reset orientation; clear the success prediction; start smoothing at the hold action."""
         np.copyto(self._quat, self.ctx.plant.ee_quat())
         self._pred[0] = 0.0
+        self._delta.fill(0.0)
         # Action that keeps the TCP where it is, so the first smoothed steps do not pull it away.
-        np.subtract(self.ctx.plant.ee_pos, self._anchor, out=self._smooth)
-        np.divide(self._smooth, self._bounds, out=self._smooth)
-        np.clip(self._smooth, -1.0, 1.0, out=self._smooth)
+        np.subtract(self.ctx.plant.ee_pos, self._anchor, out=self._smooth[:3])
+        np.divide(self._smooth[:3], self._bounds, out=self._smooth[:3])
+        np.clip(self._smooth[:3], -1.0, 1.0, out=self._smooth[:3])
+        if self.predict:
+            self._smooth[3] = -1.0  # p = 0
 
     def write_applied(self, out: np.ndarray) -> None:
-        """Applied action: smoothed position dims (+ the raw success prediction).
+        """Applied action: smoothed position dims (+ the success prediction, smoothed if `ema_prediction`).
 
         Args:
             out: Buffer of shape (dim,).
         """
-        out[:3] = self._smooth
+        out[:3] = self._smooth[:3]
         if self.predict:
-            out[3] = self.ctx.action[3]
+            out[3] = self._smooth[3] if self._n_smooth == 4 else self.ctx.action[3]
 
 
 class ActionManager:
@@ -368,6 +380,7 @@ class ActionManager:
         ctx.action = np.zeros(self.dim)
         ctx.prev_action = np.zeros(self.dim)
         ctx.applied_action = np.zeros(self.dim)
+        ctx.prev_applied_action = np.zeros(self.dim)
         self._first = True
 
     def apply(self, action: np.ndarray) -> None:
@@ -383,6 +396,7 @@ class ActionManager:
         if self._first:  # no action history yet: do not count the first action as a "change"
             np.copyto(ctx.prev_action, ctx.action)
             self._first = False
+        np.copyto(ctx.prev_applied_action, ctx.applied_action)  # at reset: the applied (hold) action
         self.term.apply(ctx.action)
         self.term.write_applied(ctx.applied_action)
 
@@ -392,4 +406,5 @@ class ActionManager:
         self.ctx.prev_action.fill(0.0)
         self.term.reset()
         self.term.write_applied(self.ctx.applied_action)
+        np.copyto(self.ctx.prev_applied_action, self.ctx.applied_action)
         self._first = True

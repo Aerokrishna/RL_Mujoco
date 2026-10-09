@@ -29,6 +29,9 @@ class ScriptedPegInsert:
                 impedance-controlled TCP drift laterally by more than the 0.25 mm radial
                 clearance, and the peg then sticks on the rim.
         If the tip stays on the rim (in contact, not entering) for `stuck_steps`, go back to align.
+
+    It uses the true peg (in-hand offset included) and inverts the action smoothing, but it cannot
+    compensate the controller dead zone: run it with `forge.task.NO_DR` (or at least the dead zone off).
     """
 
     def __init__(self, env: "TorqueEnv", hover: float = 0.002, press: float = 0.004, align_tol: float = 0.0001,
@@ -51,7 +54,8 @@ class ScriptedPegInsert:
         self.descend_step, self.stuck_steps = descend_step, stuck_steps
         self.xy_offset = np.asarray(xy_offset, dtype=np.float64)
         self.act_dim = env.action_space.shape[0]  # 4 with success prediction (a_ET)
-        self.alpha = float(env.cfg.task.action.ema_factor)  # action smoothing of the action term
+        self.ema = env.ctx.state["action_ema"]   # action smoothing α of the episode (randomized at reset)
+        self.smooth_pred = bool(env.cfg.task.action.ema_prediction) and self.act_dim > 3
         self.reset()
 
     def reset(self) -> None:
@@ -76,7 +80,7 @@ class ScriptedPegInsert:
         ee = self.env.plant.ee_pos
         tip = d.site_xpos[st.peg_tip]
         tip_err_xy = tip[:2] - (st.hole_tip[:2] + self.xy_offset)
-        hover_tcp_z = st.hole_tip[2] + st.tcp_to_tip + self.hover   # world z of the TCP while hovering
+        hover_tcp_z = st.hole_tip[2] + st.tcp_to_tip_true + self.hover   # world z of the TCP while hovering
 
         target = np.empty(3)                     # desired TCP position, world frame
         target[:2] = ee[:2] - tip_err_xy         # move the TCP so that the tip lands on the (offset) axis
@@ -88,18 +92,19 @@ class ScriptedPegInsert:
         elif np.linalg.norm(tip_err_xy) < self.align_tol and abs(ee[2] - hover_tcp_z) < 0.001:
             self.inserting = True
         if self.inserting:
-            target[2] = max(st.hole_floor[2] + st.tcp_to_tip - self.press, ee[2] - self.descend_step)
+            target[2] = max(st.hole_floor[2] + st.tcp_to_tip_true - self.press, ee[2] - self.descend_step)
         else:
             target[2] = hover_tcp_z
         # The action is the target relative to the anchor, whatever the anchor convention is.
-        desired = np.clip((target - anchor) / self.bounds, -1.0, 1.0)
-        if self.alpha < 1.0:
+        desired = np.empty(self.act_dim)
+        desired[:3] = np.clip((target - anchor) / self.bounds, -1.0, 1.0)
+        if self.act_dim > 3:
+            desired[3] = 1.0 if st.success else -1.0
+        alpha = float(self.ema[0])
+        n = self.act_dim if self.smooth_pred else 3
+        if alpha < 1.0:
             # Invert the EMA s_t = alpha * a_t + (1 - alpha) * s_{t-1} so the applied action equals `desired`
             # (as far as the [-1, 1] action bounds allow).
-            prev = self.env.ctx.applied_action[:3]
-            desired = np.clip((desired - (1.0 - self.alpha) * prev) / self.alpha, -1.0, 1.0)
-        a = np.empty(self.act_dim, dtype=np.float32)
-        a[:3] = desired
-        if self.act_dim > 3:
-            a[3] = 1.0 if st.success else -1.0
-        return a
+            prev = self.env.ctx.applied_action[:n]
+            desired[:n] = np.clip((desired[:n] - (1.0 - alpha) * prev) / alpha, -1.0, 1.0)
+        return desired.astype(np.float32)

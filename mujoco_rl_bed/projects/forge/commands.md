@@ -76,20 +76,34 @@ python projects/forge/train.py algo=recurrent_ppo asymmetric=true n_envs=4 n_ste
 
 About 200–250 steps/s on this laptop (LSTM training on CPU dominates; `torch_threads=4` measured slower than 1).
 
-## 2c. GPU machine (next run: paper clearance, smoothing on)
+## 2c. GPU machine: Isaac Lab FORGE setup
+
+First check the machine (from `mujoco_rl_bed/`, `dqn` active):
 
 ```bash
-python projects/forge/train.py algo=recurrent_ppo asymmetric=true device=cuda n_envs=8 n_steps=512 batch_size=1024 \
-    total_timesteps=5000000 log_std_init=-1.0 task.events.reset_fixed.params.pos_noise_std=0.001 \
-    run_name=gpu_asym_n1_c025
+python scripts/system_check.py              # ~5-10 min; quick=true for ~2-4 min
 ```
 
-- Clearance is the paper's 0.25 mm radial by default (no `inner_radius` override needed).
-- Smoothing (`ema_factor=0.2`), the action-rate penalty (−0.02) and success-prediction weight
-  (−0.1) are task defaults now.
-- `pos_noise_std=0.001` is the 1 mm diagnostic noise; the paper uses `0.0025`.
-- Set `n_envs` to about the number of CPU cores − 2 (the simulation runs on CPU; only the
-  network uses the GPU) and keep `n_steps * n_envs` divisible by `batch_size`.
+It reports CPU cores and load, RAM, GPU memory/utilization and other users' GPU processes, a matmul
+throughput probe, simulation steps/s vs. `n_envs`, and a short real training run with the network
+below (steps/s, peak GPU memory). Pick `n_envs` from the simulation scan (the simulation runs on CPU
+processes; only the network uses the GPU).
+
+```bash
+python projects/forge/train.py algo=recurrent_ppo asymmetric=true device=cuda n_envs=32 \
+    n_steps=128 batch_size=512 n_epochs=4 learning_rate=1e-4 lr_schedule=adaptive kl_threshold=0.008 \
+    gamma=0.995 gae_lambda=0.95 clip_range=0.2 clip_range_vf=0.2 vf_coef=1.0 ent_coef=0.0 \
+    log_std_init=0.0 lstm_hidden_size=1024 n_lstm_layers=2 net_arch="(512,128,64)" activation=elu \
+    total_timesteps=20000000 run_name=isaac
+```
+
+- These are Isaac Lab's FORGE rl_games settings (LSTM 2x1024 before an ELU MLP 512-128-64, γ 0.995,
+  KL-adaptive learning rate from 1e-4 with target 0.008, 4 epochs, minibatches of 512, horizon 128,
+  value clipping 0.2, initial σ = 1). Isaac trains 128 envs x 128 steps x 200 updates ≈ 3.3M steps.
+- The task defaults already contain the paper/Isaac environment: 15 Hz, 150-step episodes, gain/λ/EMA
+  randomization, dead zone, friction, peg offset in the hand, yaw, observation noise, 1 mm hole-pose
+  noise, delayed success-prediction penalty. Paper hole-pose noise: `task.events.reset_fixed.params.pos_noise_std=0.0025`.
+- Keep `n_steps * n_envs` divisible by `batch_size`.
 - Run it detached so it survives closing the terminal:
   `setsid -f python projects/forge/train.py ... > projects/forge/runs/gpu_run.log 2>&1 < /dev/null`
 
@@ -130,9 +144,13 @@ Most useful scalars:
 | `episode/time_to_success` | Seconds until first success (successful episodes only) |
 | `episode/contact_force_mean`, `episode/contact_force_max` | Mean / max over the episode of the step-averaged peg contact force [N] (paper's F_mean, F_max). The force penalty uses the same step-averaged force. |
 | `episode/contact_force_peak` | Max single-tick contact force [N], including short impact spikes (diagnostic only) |
-| `episode/reward_terms/<name>` | Per-term weighted episode sums (`kp_coarse`, `kp_fine`, `place_bonus`, `success_bonus`, `contact_penalty`) |
+| `episode/reward_terms/<name>` | Per-term weighted episode sums (`kp_baseline`, `kp_coarse`, `kp_fine`, `place_bonus`, `success_bonus`, `contact_penalty`, `success_pred`, `action_grad`, `action_asset`) |
+| `episode/success_pred_scale` | 0 until the env's running success rate (`episode/success_rate_ema`) reaches 25%, then 1: the success-prediction penalty is on |
+| `episode/et_correct`, `episode/et_triggered`, `episode/et_delay` | Early-termination precision inputs and delay (p > 0.9) |
+| `episode/ctrl_kp`, `ctrl_lambda`, `ctrl_ema`, `dead_zone_force`, `part_friction`, `held_offset_x/z` | Randomized dynamics of the episode (check the ranges) |
 | `episode/ik_err_max` | Non-zero only if the reset IK failed (should stay 0) |
-| `train/approx_kl`, `train/clip_fraction`, `train/entropy_loss`, `train/explained_variance` | PPO health |
+| `train/approx_kl`, `train/clip_fraction`, `train/entropy_loss`, `train/explained_variance` | PPO health (with `lr_schedule=adaptive`, approx_kl should hover around `kl_threshold`) |
+| `train/learning_rate` | Current learning rate (changes with `lr_schedule=adaptive`) |
 | `time/fps` | Training throughput (env steps/s) |
 
 ## 4. Evaluate a trained policy
@@ -177,6 +195,8 @@ python projects/forge/eval.py policy=scripted episodes=5 render=true
 
 Uses privileged state (true hole and peg poses). It should succeed in every episode with
 less than about 1 N of contact force. If it fails, the scene or contact settings are broken, not RL.
+It runs with all randomization and observation noise off (`forge.task.NO_DR`): it cannot compensate
+the controller dead zone.
 
 ## 6. Tests
 
@@ -201,7 +221,7 @@ python scripts/view_scene.py headless=true duration=5   # no window, prints drif
 | Key | Default | Meaning |
 |---|---|---|
 | `algo` | `ppo` | `ppo` (MLP) or `recurrent_ppo` (LSTM) |
-| `asymmetric` | `false` | Asymmetric actor-critic (paper): the actor sees the 20 policy observations, the critic additionally gets privileged ground truth (true peg-tip offset from the hole, hole-estimate error). The run's `config.json` records it, so eval loads it automatically |
+| `asymmetric` | `false` | Asymmetric actor-critic (paper): the actor sees the 21 policy observations, the critic gets clean privileged state instead (true peg-tip offset, hole-estimate error, success label, joint positions, randomized dynamics). The run's `config.json` records it, so eval loads it automatically |
 | `task` | `forge_peg` | Registered task name |
 | `seed` | `0` | Run seed; env *i* uses `seed + i` |
 | `n_envs` | `8` | Parallel environments (one CPU process each) |
@@ -212,16 +232,20 @@ python scripts/view_scene.py headless=true duration=5   # no window, prints drif
 | `n_steps` | `256` | Rollout length per env per update |
 | `batch_size` | `512` | Minibatch size; must divide `n_steps * n_envs` |
 | `n_epochs` | `5` | Optimization passes per update |
-| `learning_rate` | `3e-4` | Adam learning rate |
+| `learning_rate` | `3e-4` | Adam learning rate (initial value with `lr_schedule=adaptive`) |
+| `lr_schedule` | `constant` | `constant` or `adaptive` (rl_games/Isaac: after each update lr ÷ 1.5 if KL > 2·`kl_threshold`, × 1.5 if KL < `kl_threshold`/2, within [1e-6, 1e-2]) |
+| `kl_threshold` | `0.008` | Target KL of the adaptive schedule |
 | `gamma` | `0.99` | Discount factor |
 | `gae_lambda` | `0.95` | GAE λ |
 | `clip_range` | `0.2` | PPO clip range |
+| `clip_range_vf` | `0.0` | Value clipping range (rl_games `clip_value`, Isaac: 0.2; 0 = off) |
 | `ent_coef` | `0.0` | Entropy bonus |
 | `vf_coef` | `0.5` | Value loss weight |
 | `max_grad_norm` | `1.0` | Gradient clipping |
 | `target_kl` | `0.0` | Stop an update early when KL exceeds this (0 = off) |
 | `log_std_init` | `-0.5` | Initial log std of the action distribution |
 | `net_arch` | `(256,128)` | Hidden layers of actor and critic heads |
+| `activation` | `tanh` | MLP activation: `tanh`, `elu` (Isaac), `relu` |
 | `lstm_hidden_size` | `256` | LSTM width (`recurrent_ppo` only) |
 | `n_lstm_layers` | `1` | LSTM depth (`recurrent_ppo` only) |
 | `normalize_obs` | `true` | Running observation normalization (saved as `vecnormalize.pkl`) |
@@ -254,26 +278,32 @@ Any key that is not a training/eval argument is applied to the environment confi
 | Key | Default | Meaning |
 |---|---|---|
 | `sim_dt` | `0.002` | Physics timestep [s] |
-| `decimation` | `25` | Physics steps per policy step (policy rate = 1 / (sim_dt × decimation) = 20 Hz) |
-| `task.episode_length_s` | `7.5` | Episode length [s] (150 policy steps at 20 Hz; paper: 10 s) |
-| `task.action.max_step` | `0.02` | λ: max target distance from the TCP per axis [m] |
-| `task.action.ema_factor` | `0.2` | Action smoothing α (1.0 = off): applied = α·a + (1−α)·previous. Removes jitter (−76% TCP jerk vs. off) |
+| `decimation` | `33` (task default) | Physics steps per policy step (policy rate = 1 / (sim_dt × decimation) = 15.15 Hz; the paper uses 15 Hz) |
+| `task.episode_length_s` | `9.9` | Episode length [s] (150 policy steps, as in the paper) |
+| `task.action.max_step` | `0.02` | Initial λ [m]; randomized per axis by `randomize_controller` |
+| `task.action.ema_factor` | `0.0625` | Initial smoothing α; randomized per episode by `randomize_controller` (`ema_range`) |
+| `task.action.ema_prediction` | `true` | Smooth a_ET too (Isaac) |
 | `task.action.anchor_bounds` | `(0.05,0.05,0.05)` | Action range around the anchor (TCP pose with the peg tip at the hole opening; zero action = there) [m] |
-| `task.controller.kp` | `(600,600,600,100,100,100)` | Cartesian stiffness (x, y, z [N/m], rx, ry, rz [Nm/rad]) |
-| `task.rewards.<name>.weight` | see `task.py` | Reward weights: `kp_coarse`, `kp_fine`, `place_bonus`, `success_bonus`, `contact_penalty` (−β = −0.2), `success_pred` (−0.1), `action_rate` (−0.02, penalizes action changes) |
+| `task.controller.kp` | `(565,565,565,28,28,28)` | Nominal stiffness (overwritten per episode by `randomize_controller`) |
+| `task.rewards.<name>.weight` | see `task.py` | `kp_baseline`, `kp_coarse`, `kp_fine`, `place_bonus`, `success_bonus` (1), `contact_penalty` (−β = −0.2), `success_pred` (−1, delayed), `action_grad` (−0.1), `action_asset` (−0.001) |
+| `task.events.init.params.delay_until_ratio` | `0.25` | Running success rate at which the prediction penalty switches on (0 = always on) |
 | `task.scene.assets.1.inner_radius` | `0.00425` | Hole radius [m]; peg radius is 4 mm, so 0.00425 = 0.25 mm radial clearance (paper), 0.0045 = 0.5 mm |
 | `task.events.reset_fixed.params.lo` / `.hi` | `(0.55,-0.05,0.0)` / `(0.65,0.05,0.1)` | Socket position range [m] |
-| `task.events.reset_fixed.params.pos_noise_std` | `0.0` | Hole-position estimate noise [m] (paper: 0.0025) |
+| `task.events.reset_fixed.params.pos_noise_std` | `0.001` | Hole-position estimate noise [m] (Isaac 0.001, paper 0.0025) |
 | `task.events.reset_threshold.params.lo` / `.hi` | `5.0` / `10.0` | Force threshold range F_th [N] |
-| `task.events.reset_ee.params.xy_range` | `0.02` | Initial TCP lateral offset from the hole [m] |
-| `task.events.reset_ee.params.z_range` | `(0.037,0.057)` | Initial TCP height above the hole tip [m] |
+| `task.events.reset_ee.params.xy_range` / `z_range` / `yaw_range` | `0.02` / `(0.037,0.057)` / `0.785` | Initial TCP offset from the hole tip [m] and gripper yaw [rad] |
+| `task.events.randomize_controller.params.kp_noise` / `lam_noise` / `ema_range` | `(0.41,)*6` / `(0.25,)*3` / `(0.025,0.1)` | Gain, λ and α randomization (zeros / equal bounds = off) |
+| `task.events.dead_zone.params.max_dz`, `task.events.dead_zone_interval.params.max_dz` | `(5,5,5,1,1,1)` | Wrench dead zone bound at reset / every 2 s [N, Nm] |
+| `task.events.randomize_friction.params.lo` / `.hi` | `0.5` / `1.0` | Part friction range |
+| `task.events.randomize_held.params.lo` / `.hi` | `(-0.003,0,-0.003)` / `(0.003,0,0.003)` | Peg offset in the hand [m] |
+| `task.obs.term_cfg.<term>.noise_std` | see `task.py` | Actor observation noise (scalar or per entry) for `ee_pos_rel_anchor`, `ee_quat_rel_nominal`, `ee_vel`, `contact_force` |
 | `render` | `false` | Viewer (forced off when `n_envs > 1`) |
 
-Example: paper-length episodes, a softer penalty, and hole-position noise:
+Example: the paper's 2.5 mm hole-pose noise and a softer force penalty:
 
 ```bash
 python projects/forge/train.py algo=ppo n_envs=10 total_timesteps=3000000 \
-    task.episode_length_s=10 task.rewards.contact_penalty.weight=-0.1 \
+    task.rewards.contact_penalty.weight=-0.1 \
     task.events.reset_fixed.params.pos_noise_std=0.0025 run_name=noise2p5
 ```
 

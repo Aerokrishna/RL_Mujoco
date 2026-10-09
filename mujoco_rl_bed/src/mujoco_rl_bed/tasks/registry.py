@@ -64,6 +64,8 @@ def make_task_cfg(name: str) -> TaskCfg:
 def make_env_cfg(task: str, overrides: dict[str, str] | None = None) -> EnvCfg:
     """Build an `EnvCfg` for a task and apply dotted overrides.
 
+    The task's `env_defaults` (e.g. its policy rate) are applied first, then `overrides`.
+
     Args:
         task: Task name.
         overrides: Mapping such as {"sim_dt": "0.001", "task.action.pos_scale": "0.01"}.
@@ -72,8 +74,10 @@ def make_env_cfg(task: str, overrides: dict[str, str] | None = None) -> EnvCfg:
         The resolved `EnvCfg`.
     """
     cfg = EnvCfg(task=make_task_cfg(task), task_name=task)
-    if overrides:
-        apply_overrides(cfg, overrides)
+    merged = {k: str(v) for k, v in cfg.task.env_defaults.items()}  # task defaults first, CLI wins
+    merged.update(overrides or {})
+    if merged:
+        apply_overrides(cfg, merged)
     return cfg
 
 

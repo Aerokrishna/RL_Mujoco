@@ -23,12 +23,13 @@ class ObsTermCfg:
     """Per-term observation options.
 
     Attributes:
-        noise_std: Std of additive Gaussian noise (applied only in `ObsCfg.noisy_groups`).
+        noise_std: Std of additive Gaussian noise (applied only in `ObsCfg.noisy_groups`): one value
+            for all entries of the term, or one per entry (length = term dim).
         history: Number of stacked past values (1 = current only), ordered oldest -> newest.
         params: Extra keyword arguments bound to the term function.
     """
 
-    noise_std: float = 0.0
+    noise_std: float | tuple[float, ...] = 0.0
     history: int = 1
     params: dict[str, Any] = field(default_factory=dict)
 
@@ -68,11 +69,14 @@ class ActionCfg:
         anchor: `ctx.state` buffer holding the anchor position for `anchor_relative_pos`
             (e.g. the estimated hole tip) [m].
         anchor_bounds: Target range around the anchor per unit action, per axis [m].
-        max_step: λ: per-axis clip of the target around the current TCP position [m].
+        max_step: λ: per-axis clip of the target around the current TCP position [m] (initial value of
+            the `action_max_step` state buffer, shape (3,), which events may randomize per axis).
         ema_factor: Action smoothing alpha in (0, 1]: the applied (position) action is
             alpha * a_t + (1 - alpha) * applied_{t-1}. 1.0 = off. Removes step-to-step chatter
             (e.g. a policy flipping between -1 and +1) before it reaches the controller target
             (supported by `anchor_relative_pos`).
+        ema_prediction: Also smooth the success-prediction dim a_ET with the same EMA (Isaac Lab FORGE
+            smooths all action dims, so its predicted success lags the raw output).
         success_prediction: Append one action dim a_ET in [-1, 1] -> p = (a_ET + 1) / 2 in [0, 1],
             the policy's predicted probability that the task is currently solved (FORGE Sec. III-C).
             Written to `ctx.state["pred_success"]`; rewarded/used by task terms (supported by
@@ -93,6 +97,7 @@ class ActionCfg:
     anchor_bounds: tuple[float, float, float] = (0.05, 0.05, 0.05)
     max_step: float = 0.02
     ema_factor: float = 1.0
+    ema_prediction: bool = False
     success_prediction: bool = False
     params: dict[str, Any] = field(default_factory=dict)
 
@@ -209,6 +214,8 @@ class TaskCfg:
         events: Event terms, name -> `EventTermCfg`.
         episode_length_s: Episode length [s] (truncation).
         params: Free-form task parameters (read by task-specific terms).
+        env_defaults: `EnvCfg`-level defaults this task needs (e.g. {"decimation": 33} for a 15 Hz policy),
+            applied by `make_env_cfg` before the user's overrides, so the CLI still wins.
     """
 
     scene: SceneCfg = field(default_factory=SceneCfg)
@@ -220,6 +227,7 @@ class TaskCfg:
     events: dict[str, EventTermCfg] = field(default_factory=dict)
     episode_length_s: float = 5.0
     params: dict[str, Any] = field(default_factory=dict)
+    env_defaults: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         """Normalize shorthand term lists into dicts."""

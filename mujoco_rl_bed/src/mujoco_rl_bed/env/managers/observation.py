@@ -73,9 +73,9 @@ def obs_term(name: str, dim: int | Callable[["Context"], int], needs_accumulatio
 class _Entry:
     """Compiled per-group term: function, slices, scratch and noise buffers."""
 
-    __slots__ = ("name", "fn", "dim", "history", "noise_std", "acc", "scratch", "hist", "newest", "noise")
+    __slots__ = ("name", "fn", "dim", "history", "noise_std", "has_noise", "acc", "scratch", "hist", "newest", "noise")
 
-    def __init__(self, name: str, fn: Callable, dim: int, history: int, noise_std: float, acc: bool,
+    def __init__(self, name: str, fn: Callable, dim: int, history: int, noise_std: float | tuple[float, ...], acc: bool,
                  group_buf: np.ndarray, offset: int) -> None:
         """Bind views into the group buffer.
 
@@ -84,13 +84,20 @@ class _Entry:
             fn: Bound term function `fn(ctx, out)`.
             dim: Term size.
             history: Number of stacked values.
-            noise_std: Noise std (0 = none).
+            noise_std: Noise std, scalar or one value per entry (0 = none).
             acc: Whether the value comes from the accumulator.
             group_buf: The group's flat float32 buffer.
             offset: Start index of this term in `group_buf`.
         """
         self.name, self.fn, self.dim, self.history = name, fn, dim, history
-        self.noise_std, self.acc = noise_std, acc
+        std = np.asarray(noise_std, dtype=np.float32)
+        if std.ndim == 1 and std.shape != (dim,):
+            raise ValueError(f"noise_std for '{name}' has {std.size} entries, the term has {dim}")
+        if std.ndim > 1 or np.any(std < 0.0):
+            raise ValueError(f"noise_std for '{name}' must be a non-negative scalar or a 1D sequence")
+        self.noise_std = std if std.ndim == 1 else np.full(dim, float(std), dtype=np.float32)
+        self.has_noise = bool(np.any(self.noise_std > 0.0))
+        self.acc = acc
         self.scratch = np.zeros(dim)
         self.hist = group_buf[offset: offset + dim * history]        # view, oldest -> newest
         self.newest = self.hist[dim * (history - 1):]                 # view of the last slot
@@ -249,7 +256,7 @@ class ObservationManager:
             if e.history > 1:
                 e.hist[:-e.dim] = e.hist[e.dim:]  # shift history left by one slot
             np.copyto(e.newest, src, casting="same_kind")  # float64 -> float32
-            if e.noise_std > 0.0:
+            if e.has_noise:
                 ctx.rng.standard_normal(dtype=np.float32, out=e.noise)
                 e.noise *= e.noise_std
                 e.newest += e.noise

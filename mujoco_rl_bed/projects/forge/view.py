@@ -8,6 +8,7 @@ Usage (`conda activate dqn` first; works from any directory):
     python projects/forge/view.py run=<run_folder> checkpoint=checkpoints/model_500000_steps.zip
     python projects/forge/view.py mode=scripted realtime=false     # as fast as possible
 
+`mode=scripted` switches the dynamics randomization and observation noise off (`forge.task.NO_DR`).
 Close the window (or Ctrl+C) to stop. Each episode also prints the eval metrics.
 All `eval.py` keys work here (episodes, seed, deterministic, env overrides such as
 `task.events.reset_fixed.params.pos_noise_std=0.0025`). `render=true` is the default.
@@ -104,6 +105,9 @@ def main(argv: list[str]) -> None:
         defaults["policy"] = "scripted"
         if mode == "scripted":
             from forge.scripted import ScriptedPegInsert as factory
+            from forge.task import NO_DR
+
+            defaults.update(NO_DR)  # the expert cannot compensate the dead zone (CLI overrides still win)
         elif mode == "idle":
             factory = IdlePolicy
         else:

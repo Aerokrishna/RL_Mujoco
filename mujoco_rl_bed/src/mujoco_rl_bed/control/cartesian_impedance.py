@@ -73,6 +73,11 @@ class CartesianImpedance:
     plus Coriolis (gravity only if `compensate_coriolis=False`). The result is optionally
     rate-limited per tick and saturated to the actuator torque limits.
 
+    Optional dead zone (`set_dead_zone`, FORGE / Isaac Lab `factory_control`): each wrench component
+    with |F_i| < dz_i is zeroed, the others shrink by dz_i (F_i <- sign(F_i) max(0, |F_i| - dz_i)).
+    This mimics joint friction: small commanded forces produce no motion. Off (zero) by default; the
+    dead zone is kept across `reset` (events set it).
+
     Gains can be changed every policy step through `set_target(kp=..., kd=...)`, which
     is what variable-impedance actions use. If `kd` is omitted while `kp` changes, and
     the config uses automatic damping (`kd=None`), Kd is reset to 2 sqrt(Kp).
@@ -122,6 +127,9 @@ class CartesianImpedance:
         self._err_r = self._err[3:]
         self._v = np.zeros(6)
         self._F = np.zeros(6)
+        self.dead_zone = np.zeros(6)  # per wrench component [N, Nm]
+        self._dz_on = False
+        self._absF = np.zeros(6)
         self._tau = np.zeros(n)
         self._tau_null = np.zeros(n)
         self._tau_proj = np.zeros(n)
@@ -154,6 +162,15 @@ class CartesianImpedance:
                 critical_damping(self.kp, out=self.kd)
         if kd is not None:
             np.copyto(self.kd, kd)
+
+    def set_dead_zone(self, dz: np.ndarray) -> None:
+        """Set the wrench dead zone (zeros disable it).
+
+        Args:
+            dz: Per-component thresholds [N (3), Nm (3)], shape (6,), >= 0.
+        """
+        np.copyto(self.dead_zone, dz)
+        self._dz_on = bool(np.any(self.dead_zone > 0.0))
 
     def reset(self, plant: "FrankaPlant") -> None:
         """Hold the current TCP pose, restore nominal gains, and clear the rate-limit memory.
@@ -211,6 +228,12 @@ class CartesianImpedance:
         np.multiply(self.kp, self._err, out=self._F)
         np.multiply(self.kd, self._v, out=self._v)
         np.subtract(self._F, self._v, out=self._F)
+        if self._dz_on:  # F <- sign(F) max(0, |F| - dz)
+            a = self._absF
+            np.abs(self._F, out=a)
+            np.subtract(a, self.dead_zone, out=a)
+            np.maximum(a, 0.0, out=a)
+            np.copysign(a, self._F, out=self._F)
         np.dot(J.T, self._F, out=tau)
 
         # Null-space posture: (I - J^T J#^T) [kn (q_null - q) - dn qd]

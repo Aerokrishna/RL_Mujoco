@@ -64,6 +64,17 @@ def action_rate_l2(ctx: "Context") -> float:
     return float(np.dot(d, d))
 
 
+@reward_term("applied_action_rate_norm")
+def applied_action_rate_norm(ctx: "Context") -> float:
+    """L2 norm (not squared) of the change of the applied (e.g. smoothed) action between policy steps.
+
+    Isaac Lab Factory/FORGE `action_grad_penalty` = ||a_t - a_{t-1}|| on its smoothed actions; use a
+    negative weight. On the first step it measures the change from the reset (hold) action.
+    """
+    d = ctx.applied_action - ctx.prev_applied_action
+    return float(np.sqrt(np.dot(d, d)))
+
+
 @reward_term("action_l2")
 def action_l2(ctx: "Context") -> float:
     """Squared action norm (use a negative weight)."""

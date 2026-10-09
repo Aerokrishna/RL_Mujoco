@@ -1,25 +1,27 @@
-"""FORGE-style insertion terms (Noseworthy et al., "FORGE", arXiv:2408.04587), first pass.
+"""FORGE-style insertion terms (Noseworthy et al., "FORGE", arXiv:2408.04587).
 
-Implemented from the paper:
-- keypoint reward with coarse and fine logistic kernels (App. B, Eq. 8),
+Where the paper is silent, values and mechanisms follow NVIDIA's reference implementation in
+Isaac Lab (`isaaclab_tasks/direct/forge`, `.../factory`), referred to as "Isaac" below.
+
+Implemented:
+- keypoint reward: baseline (Isaac), coarse and fine logistic kernels (App. B, Eq. 8),
   K_{a,b}(x) = 1 / (e^{-ax} + b + e^{ax}),
 - bonuses I_place + I_success (Eq. 2),
 - excessive-force penalty -β max(0, ||F|| - F_th) (Eq. 3), with F_th randomized per
   episode and observed by the policy (π(a | o, F_th)),
-- observations relative to the fixed part's tip, contact force, F_th,
-  previous action (the latter via the generic `last_action` term),
-- initial state: fixed-part pose and hand pose relative to the fixed part (Table II).
-
 - success prediction (Sec. III-C): action a_ET -> p in [0, 1] (`ctx.state["pred_success"]`),
-  penalty -|p - y_t| with y_t the true success label; early termination when p > p_term
-  (off during training, as in the paper; enable for evaluation), and the paper's
-  early-termination metrics.
-
-- controller randomization (Sec. III-B): per episode Kp (translational) ~ U[400, 800] N/m with
-  Kd = 2 sqrt(Kp), and λ ~ U[1.6, 2.5] cm; not observed by the actor, given to the critic.
-
-Not yet implemented: EE/force observation noise (the hooks exist, default 0), part friction /
-mass randomization, force dead zone.
+  penalty -|p - y_t|, switched on only once the success rate reaches `delay_until_ratio`
+  (Isaac: 0.25; before that an untrained predictor would cancel the success bonus); early
+  termination when p > p_term (evaluation only) and the paper's early-termination metrics,
+- Isaac action penalties: ||a_t - a_{t-1}|| on the smoothed action (core `applied_action_rate_norm`)
+  and ||p_targ - p_ee|| / λ_nominal (`forge_action_penalty_asset`),
+- dynamics randomization (Sec. III-B, Isaac sampling): per-axis Kp (x/÷ (1 + U(0, 0.41)) around 565 N/m
+  and 28 Nm/rad, Kd = 2 sqrt(Kp)), per-axis λ (x/÷ (1 + U(0, 0.25)) around 2 cm), action EMA
+  α ~ U(0.025, 0.1), wrench dead zone U(0, [5 N, 1 Nm]) per component (re-drawn every 2 s), part
+  friction U(0.5, 1.0); all unobserved by the actor and given to the critic,
+- initial state: fixed-part pose, hand pose (incl. yaw ±45°) relative to the fixed part, and the
+  held part's offset in the hand (x, z ±3 mm, unobserved) (Table II / Isaac),
+- observation noise (Isaac): see `task.py` (`ObsCfg.term_cfg`).
 
 Shared per-step state lives in a `ForgeState` (in `ctx.state["forge"]`). It is
 updated once per policy step by the `forge_update` step event, so the rewards,
@@ -77,7 +79,20 @@ class ForgeState:
         hole_mocap: Mocap index of the socket body.
         tip_local: Hole-tip site position in the socket body frame [m], shape (3,).
         floor_local: Hole-floor site position in the socket body frame [m], shape (3,).
-        tcp_to_tip: Distance from the TCP to the peg tip along the peg axis [m].
+        tcp_to_tip: Nominal distance from the TCP to the peg tip along the peg axis [m] (the policy's
+            belief: used for the anchor, unaffected by the in-hand offset).
+        tcp_to_tip_true: Actual TCP-to-tip distance along the axis this episode [m] (nominal + held offset z).
+        peg_pos_nominal: Peg body position in the hand frame from the model [m], shape (3,).
+        held_offset: Peg offset in the hand frame this episode [m], shape (3,) (unobserved by the actor).
+        part_geoms: Geom ids of the peg and the socket (friction randomization).
+        friction: Part sliding friction this episode.
+        kp: Controller stiffness this episode [N/m (3), Nm/rad (3)], shape (6,).
+        lam: λ per axis this episode [m] (the action term's `action_max_step` buffer), shape (3,).
+        ema: Action smoothing α this episode (the action term's `action_ema` buffer), shape (1,).
+        dead_zone: Wrench dead zone [N (3), Nm (3)], shape (6,) (re-drawn during the episode).
+        pred_scale: Success-prediction penalty scale: 0 until the running success rate reaches
+            `delay_until_ratio`, then 1 for good (Isaac's delayed penalty).
+        success_rate_ema: Running mean of the per-step success label (time constant `gate_window` steps).
         home_quat: TCP orientation at q_home (gripper pointing down), shape (4,).
         hole_tip: True hole-tip position [m], shape (3,).
         hole_floor: True hole-floor position [m], shape (3,).
@@ -106,7 +121,7 @@ class ForgeState:
     """
 
     def __init__(self, ctx: "Context", peg: str, hole: str, place_xy: float, success_dist: float,
-                 p_term: float = 0.9) -> None:
+                 p_term: float = 0.9, delay_until_ratio: float = 0.25, gate_window: int = 750) -> None:
         """Resolve ids and allocate buffers.
 
         Args:
@@ -116,6 +131,8 @@ class ForgeState:
             place_xy: Lateral tolerance for "placed"/"success" [m].
             success_dist: Max tip height above the floor for success [m].
             p_term: Success-prediction threshold for early termination and ET metrics.
+            delay_until_ratio: Running success rate that switches the prediction penalty on (0 = always on).
+            gate_window: Time constant of the running success rate [policy steps].
         """
         m, d, h = ctx.model, ctx.data, ctx.handles
         self.peg_body = h.body_ids[peg]
@@ -135,16 +152,27 @@ class ForgeState:
         self.tip_local = m.site_pos[h.site_ids[f"{hole}_tip"]].copy()
         self.floor_local = m.site_pos[h.site_ids[f"{hole}_floor"]].copy()
         self.tcp_to_tip = float(np.linalg.norm(d.site_xpos[self.peg_tip] - d.site_xpos[h.tcp_site_id]))
+        self.tcp_to_tip_true = self.tcp_to_tip
+        self.peg_pos_nominal = m.body_pos[self.peg_body].copy()
+        self.held_offset = np.zeros(3)
+        self.part_geoms = np.flatnonzero((m.geom_bodyid == self.peg_body) | (m.geom_bodyid == hole_body))
+        self.friction = float(m.geom_friction[self.part_geoms[0], 0])
         self.home_quat = ctx.plant.ee_quat().copy()
         self.home_quat_inv = np.zeros(4)
         mujoco.mju_negQuat(self.home_quat_inv, self.home_quat)  # conjugate = inverse for unit quaternions
         self.place_xy = place_xy
         self.success_dist = success_dist
         self.p_term = float(p_term)
-        # Controller parameters of the episode (overwritten by forge_randomize_controller if enabled).
-        self.kp = float(ctx.controller.kp_nominal[0])
-        self.lam = float(ctx.buffer("action_max_step", 1)[0])
+        # Controller parameters of the episode (overwritten by the randomization events if enabled).
+        self.kp = np.asarray(ctx.controller.kp_nominal, dtype=np.float64).copy()
+        self.lam = ctx.state["action_max_step"]  # owned by the action term (shape (3,))
+        self.ema = ctx.state["action_ema"]
+        self.dead_zone = np.zeros(6)
         self.pred = ctx.buffer("pred_success", 1)
+        self.delay_until_ratio = float(delay_until_ratio)
+        self.gate_window = max(1, int(gate_window))
+        self.success_rate_ema = 0.0
+        self.pred_scale = 1.0 if self.delay_until_ratio <= 0.0 else 0.0
         self.first_pred_step = -1
         self.pred_correct = False
 
@@ -231,6 +259,11 @@ class ForgeState:
             self._f_peak = max(self._f_peak, self.force_norm)
             self._f_n += 1
             self._placed_any = self._placed_any or self.placed
+            # Delayed prediction penalty (Isaac: on once the batch success fraction >= delay_until_ratio;
+            # here: per env, from a running mean of the success label over ~gate_window steps).
+            self.success_rate_ema += ((1.0 if self.success else 0.0) - self.success_rate_ema) / self.gate_window
+            if self.pred_scale == 0.0 and self.success_rate_ema >= self.delay_until_ratio:
+                self.pred_scale = 1.0
             if self.success and self.first_success_step < 0:
                 self.first_success_step = k
             if self.pred[0] > self.p_term and self.first_pred_step < 0:
@@ -269,8 +302,15 @@ class ForgeState:
             "et_delay": ((self.first_pred_step - self.first_success_step) * ctx.policy_dt
                          if self.first_pred_step >= 0 and self.pred_correct and self.first_success_step >= 0 else -1.0),
             "pred_success_final": float(self.pred[0]),
-            "ctrl_kp": self.kp,
-            "ctrl_lambda": self.lam,
+            "ctrl_kp": float(np.mean(self.kp[:3])),
+            "ctrl_lambda": float(np.mean(self.lam)),
+            "ctrl_ema": float(self.ema[0]),
+            "dead_zone_force": float(np.mean(self.dead_zone[:3])),
+            "part_friction": self.friction,
+            "held_offset_x": float(self.held_offset[0]),
+            "held_offset_z": float(self.held_offset[2]),
+            "success_pred_scale": self.pred_scale,
+            "success_rate_ema": self.success_rate_ema,
         }
 
 
@@ -289,7 +329,8 @@ def _st(ctx: "Context") -> ForgeState:
 # ---------------------------------------------------------------------------------- events
 @event_term("forge_init")
 def forge_init(ctx: "Context", peg: str = "peg", hole: str = "hole", place_xy: float = 0.0025,
-               success_dist: float = 0.001, p_term: float = 0.9) -> None:
+               success_dist: float = 0.001, p_term: float = 0.9, delay_until_ratio: float = 0.25,
+               gate_window: int = 750) -> None:
     """Startup: create the `ForgeState` and register the episode-metrics hook.
 
     Args:
@@ -299,9 +340,13 @@ def forge_init(ctx: "Context", peg: str = "peg", hole: str = "hole", place_xy: f
         place_xy: Lateral tolerance for place/success [m] (paper "Place Dist." 2.5 mm).
         success_dist: Tip height above the hole floor for success [m] (paper: within 1 mm of the base).
         p_term: Success-prediction threshold used for the early-termination metrics.
+        delay_until_ratio: Success rate at which the prediction penalty switches on (Isaac: 0.25; 0 = always).
+        gate_window: Time constant of the running success rate [policy steps] (750 = 5 episodes).
     """
     ctx.obs_mgr.accumulated("contact_force")  # fail early: the penalty needs the step-averaged force term
-    st = ForgeState(ctx, peg, hole, place_xy, success_dist, p_term)
+    if "action_max_step" not in ctx.state or "action_ema" not in ctx.state:
+        raise ValueError("forge_peg needs the `anchor_relative_pos` action term")
+    st = ForgeState(ctx, peg, hole, place_xy, success_dist, p_term, delay_until_ratio, gate_window)
     ctx.state["forge"] = st
     ctx.episode_info_hooks.append(st.episode_info)
 
@@ -330,23 +375,35 @@ def forge_reset_fixed(ctx: "Context", lo: tuple[float, float, float] = (0.55, -0
 
 @event_term("forge_reset_ee")
 def forge_reset_ee(ctx: "Context", xy_range: float = 0.02, z_range: tuple[float, float] = (0.037, 0.057),
-                   ik_tol: float = 1e-3) -> None:
-    """Reset: place the TCP above the true hole tip by IK (gripper pointing down).
+                   yaw_range: float = 0.785, tip_clearance: float = 0.001, ik_tol: float = 1e-3) -> None:
+    """Reset: place the TCP above the true hole tip by IK (gripper pointing down, random yaw).
 
-    The TCP target is hole_tip + (U(±xy_range), U(±xy_range), U(z_range)) (paper Table II
-    "Hand: x, y (rel)" and "Hand: z (rel)"). Must run after `forge_reset_fixed`.
+    The TCP target is hole_tip + (U(±xy_range), U(±xy_range), U(z_range)) (paper Table II "Hand: x, y
+    (rel)" and "Hand: z (rel)"; Isaac `hand_init_pos` 0.047 ± 0.01) with the gripper yawed by U(±yaw_range)
+    about the world z axis (Isaac `hand_init_orn_noise` 0.785 rad). The height is raised if needed so the
+    peg tip, including its in-hand offset, starts at least `tip_clearance` above the hole tip. Must run
+    after `forge_reset_fixed` and `forge_randomize_held`.
 
     Args:
         ctx: Context.
         xy_range: Lateral half-range [m].
         z_range: Height range of the TCP above the hole tip [m].
+        yaw_range: Yaw half-range [rad] (0 = always the nominal orientation).
+        tip_clearance: Minimum initial peg-tip height above the hole tip [m].
         ik_tol: IK error above which the worst error is recorded in the episode metrics [m].
     """
     st = _st(ctx)
     r = ctx.rng
     target = st.hole_tip + np.array([r.uniform(-xy_range, xy_range), r.uniform(-xy_range, xy_range),
                                      r.uniform(*z_range)])
-    _, err = solve_tcp_ik(ctx.plant, target, st.home_quat, q_init=ctx.handles.q_home)
+    target[2] = max(target[2], st.hole_tip[2] + st.tcp_to_tip_true + tip_clearance)
+    quat = st.home_quat
+    if yaw_range > 0.0:
+        yaw = r.uniform(-yaw_range, yaw_range)
+        qz = np.array([math.cos(0.5 * yaw), 0.0, 0.0, math.sin(0.5 * yaw)])  # world-z rotation
+        quat = np.zeros(4)
+        mujoco.mju_mulQuat(quat, qz, st.home_quat)
+    _, err = solve_tcp_ik(ctx.plant, target, quat, q_init=ctx.handles.q_home)
     st.ik_err_max = err if err > ik_tol else 0.0
 
 
@@ -362,28 +419,111 @@ def forge_sample_threshold(ctx: "Context", lo: float = 5.0, hi: float = 10.0) ->
     _st(ctx).f_th = float(ctx.rng.uniform(lo, hi))
 
 
-@event_term("forge_randomize_controller")
-def forge_randomize_controller(ctx: "Context", kp_range: tuple[float, float] = (400.0, 800.0),
-                               lam_range: tuple[float, float] = (0.016, 0.025)) -> None:
-    """Reset: sample the controller's translational stiffness Kp and the action clip λ (paper Table II).
+def _isaac_multiplier(rng: np.random.Generator, noise: np.ndarray) -> np.ndarray:
+    """Isaac `get_random_prop_gains` factor: m = 1 + U(0, noise), inverted (1 / m) with probability 1/2.
 
-    One Kp is drawn for x, y and z (rotational gains unchanged); Kd follows as 2 sqrt(Kp) when the
-    controller uses automatic damping. Runs before the controller reset, which applies the nominal gains.
-    The maximum commandable force is λ * Kp (paper: 6.4 to 20 N).
+    Args:
+        rng: Random generator.
+        noise: Per-component noise level, shape (k,).
+
+    Returns:
+        Multipliers, shape (k,).
+    """
+    m = 1.0 + rng.uniform(0.0, 1.0, size=noise.shape) * noise
+    return np.where(rng.uniform(size=noise.shape) > 0.5, 1.0 / m, m)
+
+
+@event_term("forge_randomize_controller")
+def forge_randomize_controller(ctx: "Context",
+                               kp_default: tuple[float, ...] = (565.0, 565.0, 565.0, 28.0, 28.0, 28.0),
+                               kp_noise: tuple[float, ...] = (0.41, 0.41, 0.41, 0.41, 0.41, 0.41),
+                               lam_default: float = 0.02, lam_noise: tuple[float, float, float] = (0.25, 0.25, 0.25),
+                               ema_range: tuple[float, float] = (0.025, 0.1)) -> None:
+    """Reset: sample the controller gains, λ and the action EMA α (Isaac Lab FORGE `_reset_idx`).
+
+    Per component: Kp = kp_default * m, m = 1 + U(0, kp_noise) or its inverse (x: [400, 797] N/m around 565;
+    paper Table II: [400, 800]); Kd = 2 sqrt(Kp) when the controller uses automatic damping. Per axis:
+    λ = lam_default * m with lam_noise 0.25 ([1.6, 2.5] cm, Table II). α ~ U(ema_range). The maximum
+    commandable force per axis is λ Kp (paper: 6.4 to 20 N). Runs before the controller reset, which
+    applies the nominal gains. Zero noise / an equal range disables a part.
 
     Args:
         ctx: Context.
-        kp_range: Translational stiffness range [N/m].
-        lam_range: λ range [m].
+        kp_default: Nominal stiffness [N/m (3), Nm/rad (3)].
+        kp_noise: Stiffness noise level per component.
+        lam_default: Nominal λ [m].
+        lam_noise: λ noise level per axis.
+        ema_range: Range of the action smoothing α (Isaac FORGE: [0.025, 0.1]).
     """
     st = _st(ctx)
     c = ctx.controller
-    st.kp = float(ctx.rng.uniform(*kp_range))
-    st.lam = float(ctx.rng.uniform(*lam_range))
-    c.kp_nominal[:3] = st.kp
+    r = ctx.rng
+    st.kp[:] = np.asarray(kp_default, dtype=np.float64) * _isaac_multiplier(r, np.asarray(kp_noise, dtype=np.float64))
+    c.kp_nominal[:] = st.kp
     if getattr(c, "auto_kd", False):
-        c.kd_nominal[:3] = 2.0 * np.sqrt(st.kp)
-    ctx.buffer("action_max_step", 1)[0] = st.lam
+        c.kd_nominal[:] = 2.0 * np.sqrt(st.kp)
+    st.lam[:] = lam_default * _isaac_multiplier(r, np.asarray(lam_noise, dtype=np.float64))
+    lo, hi = ema_range
+    st.ema[0] = float(r.uniform(lo, hi)) if hi > lo else float(lo)
+    if not 0.0 < st.ema[0] <= 1.0:
+        raise ValueError(f"ema_range must lie in (0, 1], got {ema_range}")
+
+
+@event_term("forge_randomize_dead_zone")
+def forge_randomize_dead_zone(ctx: "Context",
+                              max_dz: tuple[float, ...] = (5.0, 5.0, 5.0, 1.0, 1.0, 1.0)) -> None:
+    """Reset / interval: sample the controller's wrench dead zone dz ~ U(0, max_dz) per component.
+
+    Paper Sec. III-B (robot dynamics randomization, [0, 5] N) and Isaac (`default_dead_zone`
+    [5, 5, 5, 1, 1, 1], drawn at reset and every 2 s). Commanded wrench components below dz are zeroed,
+    larger ones reduced by dz (see `CartesianImpedance.set_dead_zone`).
+
+    Args:
+        ctx: Context.
+        max_dz: Upper bound per component [N (3), Nm (3)] (zeros disable the dead zone).
+    """
+    st = _st(ctx)
+    st.dead_zone[:] = ctx.rng.uniform(0.0, 1.0, size=6) * np.asarray(max_dz, dtype=np.float64)
+    ctx.controller.set_dead_zone(st.dead_zone)
+
+
+@event_term("forge_randomize_friction")
+def forge_randomize_friction(ctx: "Context", lo: float = 0.5, hi: float = 1.0) -> None:
+    """Reset: sample the sliding friction of the peg and socket, μ ~ U(lo, hi) (paper Table II, 8 mm peg).
+
+    Both parts get the same μ (MuJoCo uses the larger of the two geoms' coefficients). Isaac's PhysX
+    setup (held 0.75, fixed static U(0.25, 1.25), averaged) gives the same static range [0.5, 1.0];
+    MuJoCo has no separate static/dynamic coefficient.
+
+    Args:
+        ctx: Context.
+        lo: Lower bound.
+        hi: Upper bound.
+    """
+    st = _st(ctx)
+    st.friction = float(ctx.rng.uniform(lo, hi)) if hi > lo else float(lo)
+    ctx.model.geom_friction[st.part_geoms, 0] = st.friction
+
+
+@event_term("forge_randomize_held")
+def forge_randomize_held(ctx: "Context", lo: tuple[float, float, float] = (-0.003, 0.0, -0.003),
+                         hi: tuple[float, float, float] = (0.003, 0.0, 0.003)) -> None:
+    """Reset: offset the peg in the hand by U(lo, hi) in the hand frame (Isaac `held_asset_pos_noise`).
+
+    Hand frame: z along the peg axis (out of the gripper, so +z lowers the tip), y the finger-closing
+    direction (kept 0: the fingers center the peg), x the remaining in-plane direction. The policy is not
+    told: the anchor still assumes the nominal grasp, so this adds unobserved lateral and vertical error
+    (the critic sees it). The peg stays rigidly attached (no slip during the episode).
+
+    Args:
+        ctx: Context.
+        lo: Lower offset bound [m].
+        hi: Upper offset bound [m].
+    """
+    st = _st(ctx)
+    st.held_offset[:] = ctx.rng.uniform(lo, hi)
+    ctx.model.body_pos[st.peg_body] = st.peg_pos_nominal + st.held_offset
+    st.tcp_to_tip_true = st.tcp_to_tip + float(st.held_offset[2])
 
 
 @event_term("forge_update")
@@ -397,7 +537,8 @@ def forge_update(ctx: "Context") -> None:
 def ee_pos_rel_anchor(ctx: "Context", out: np.ndarray) -> None:
     """TCP position relative to the anchor [m], shape (3,).
 
-    For `forge_peg` this is the peg-tip position relative to the (estimated) hole opening.
+    For `forge_peg` this is the peg-tip position relative to the (estimated) hole opening, assuming the
+    nominal grasp (the in-hand offset from `forge_randomize_held` is not included).
     """
     np.subtract(ctx.plant.ee_pos, ctx.buffer(ANCHOR, 3), out=out)
 
@@ -449,12 +590,26 @@ def anchor_error_gt(ctx: "Context", out: np.ndarray) -> None:
     out[2] -= st.tcp_to_tip  # anchor = hole tip estimate + (0, 0, tcp_to_tip)
 
 
-@obs_term("controller_params_gt", dim=2)
+@obs_term("controller_params_gt", dim=16)
 def controller_params_gt(ctx: "Context", out: np.ndarray) -> None:
-    """Privileged: this episode's [Kp (translational) [N/m], λ [m]], shape (2,)."""
+    """Privileged: [Kp (6) [N/m, Nm/rad], λ (3) [m], EMA α (1), dead zone (6) [N, Nm]], shape (16,).
+
+    Isaac's critic state has task_prop_gains, pos/rot_threshold and ema_factor; the dead zone is added
+    because it changes during the episode and the actor cannot observe it.
+    """
     st = _st(ctx)
-    out[0] = st.kp
-    out[1] = st.lam
+    out[0:6] = st.kp
+    out[6:9] = st.lam
+    out[9] = st.ema[0]
+    out[10:16] = st.dead_zone
+
+
+@obs_term("part_params_gt", dim=4)
+def part_params_gt(ctx: "Context", out: np.ndarray) -> None:
+    """Privileged: [part friction μ, peg offset in the hand (3) [m]], shape (4,)."""
+    st = _st(ctx)
+    out[0] = st.friction
+    out[1:4] = st.held_offset
 
 
 @obs_term("success_gt", dim=1)
@@ -470,6 +625,12 @@ def hole_tip_gt(ctx: "Context", out: np.ndarray) -> None:
 
 
 # ---------------------------------------------------------------------------------- rewards
+@reward_term("forge_kp_baseline")
+def forge_kp_baseline(ctx: "Context", a: float = 5.0, b: float = 4.0) -> float:
+    """Baseline keypoint reward K_{a,b}(d_kp) (Isaac Factory/FORGE `kp_baseline`: a=5, b=4; not in the paper)."""
+    return logistic_kernel(_st(ctx).kp_dist, a, b)
+
+
 @reward_term("forge_kp_coarse")
 def forge_kp_coarse(ctx: "Context", a: float = 50.0, b: float = 2.0) -> float:
     """Coarse keypoint reward K_{a,b}(d_kp) (paper App. B, 8 mm peg: a=50, b=2)."""
@@ -509,9 +670,29 @@ def forge_contact_penalty(ctx: "Context") -> float:
 
 @reward_term("forge_success_pred_error")
 def forge_success_pred_error(ctx: "Context") -> float:
-    """|p - y_t|: predicted success probability vs. true success label (use weight -1; paper Eq. 7)."""
+    """scale * |p - y_t|: predicted success vs. true label (use weight -1; paper Eq. 7).
+
+    scale (`ForgeState.pred_scale`) is 0 until the running success rate reaches `delay_until_ratio`
+    (Isaac's delayed penalty), then 1.
+    """
     st = _st(ctx)
-    return abs(float(st.pred[0]) - (1.0 if st.success else 0.0))
+    if st.pred_scale == 0.0:
+        return 0.0
+    return st.pred_scale * abs(float(st.pred[0]) - (1.0 if st.success else 0.0))
+
+
+@reward_term("forge_action_penalty_asset")
+def forge_action_penalty_asset(ctx: "Context", lam_nominal: float = 0.02) -> float:
+    """||p_targ - p_ee|| / λ_nominal, the unclipped target's distance from the TCP (Isaac `action_penalty_asset`).
+
+    Use a negative weight (Isaac: -0.001). Isaac adds |Δyaw| / rot_threshold; this task has no yaw action.
+
+    Args:
+        ctx: Context.
+        lam_nominal: Normalizer [m] (Isaac: the nominal `pos_action_threshold`, 0.02).
+    """
+    d = ctx.state["action_target_delta"]
+    return math.sqrt(d[0] * d[0] + d[1] * d[1] + d[2] * d[2]) / lam_nominal
 
 
 # ---------------------------------------------------------------------------------- terminations

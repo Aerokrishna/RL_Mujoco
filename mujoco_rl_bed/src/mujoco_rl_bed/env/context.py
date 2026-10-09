@@ -43,6 +43,8 @@ class Context:
         prev_action: Previous action, same shape.
         applied_action: Action actually applied after term-side processing (e.g. EMA smoothing),
             same shape; equals `action` for terms without smoothing. Observed via `last_action`.
+        prev_applied_action: `applied_action` of the previous policy step (after a reset: the
+            applied action of the reset state, e.g. the hold action of a smoothed term).
         state: Named task buffers (targets, success flags, nominal model params, ...).
         episode_info_hooks: Callables `hook(ctx) -> dict` merged into `info` at episode end
             (task metrics such as contact-force statistics).
@@ -63,6 +65,7 @@ class Context:
     action: np.ndarray = field(default_factory=lambda: np.zeros(0))
     prev_action: np.ndarray = field(default_factory=lambda: np.zeros(0))
     applied_action: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    prev_applied_action: np.ndarray = field(default_factory=lambda: np.zeros(0))
     state: dict[str, Any] = field(default_factory=dict)
     episode_info_hooks: list[Callable[["Context"], dict]] = field(default_factory=list)
     obs_mgr: Any = None

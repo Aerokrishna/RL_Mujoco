@@ -4,3 +4,5 @@ __pycache__/
 *.egg-info/
 .pytest_cache/
 MUJOCO_LOG.TXT
+# system_check.py reports (machine-specific)
+system_check_*.json

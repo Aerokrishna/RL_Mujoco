@@ -35,7 +35,7 @@ from typing import Any, Sequence
 
 import torch
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CallbackList, CheckpointCallback
+from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
 from stable_baselines3.common.vec_env import VecNormalize
 
 import mujoco_rl_bed.tasks  # noqa: F401  (registers tasks)
@@ -69,16 +69,22 @@ class TrainCfg:
         n_steps: Rollout length per env per update.
         batch_size: Minibatch size (for RecurrentPPO: number of transitions per minibatch).
         n_epochs: Optimization epochs per update.
-        learning_rate: Adam learning rate.
+        learning_rate: Adam learning rate (the initial value with `lr_schedule=adaptive`).
+        lr_schedule: "constant", or "adaptive" (rl_games / Isaac Lab): after every PPO update the rate is
+            divided by 1.5 if the update's approx. KL > 2 * `kl_threshold` and multiplied by 1.5 if it is
+            < 0.5 * `kl_threshold`, within [1e-6, 1e-2].
+        kl_threshold: Target KL of the adaptive schedule (Isaac Lab FORGE: 0.008).
         gamma: Discount factor.
         gae_lambda: GAE lambda.
         clip_range: PPO clip range.
+        clip_range_vf: Value-function clip range (rl_games `clip_value`; 0 = off).
         ent_coef: Entropy coefficient.
         vf_coef: Value loss coefficient.
         max_grad_norm: Gradient clipping.
         target_kl: Early-stop an update when the approx. KL exceeds this (0 = off).
         log_std_init: Initial log std of the Gaussian policy.
         net_arch: Hidden layers of the actor and critic MLP heads.
+        activation: MLP activation: "tanh" (SB3 default), "elu" (Isaac Lab FORGE) or "relu".
         lstm_hidden_size: LSTM width (recurrent_ppo).
         n_lstm_layers: LSTM depth (recurrent_ppo).
         normalize_obs: Running observation normalization (VecNormalize).
@@ -106,15 +112,19 @@ class TrainCfg:
     batch_size: int = 512
     n_epochs: int = 5
     learning_rate: float = 3e-4
+    lr_schedule: str = "constant"
+    kl_threshold: float = 0.008
     gamma: float = 0.99
     gae_lambda: float = 0.95
     clip_range: float = 0.2
+    clip_range_vf: float = 0.0
     ent_coef: float = 0.0
     vf_coef: float = 0.5
     max_grad_norm: float = 1.0
     target_kl: float = 0.0
     log_std_init: float = -0.5
     net_arch: tuple[int, ...] = (256, 128)
+    activation: str = "tanh"
     lstm_hidden_size: int = 256
     n_lstm_layers: int = 1
     normalize_obs: bool = True
@@ -125,6 +135,90 @@ class TrainCfg:
     init_from: str = ""
     init_checkpoint: str = ""
     verbose: int = 1
+
+
+_ACTIVATIONS = {"tanh": torch.nn.Tanh, "elu": torch.nn.ELU, "relu": torch.nn.ReLU}
+
+
+class AdaptiveLR:
+    """KL-adaptive learning rate (rl_games `AdaptiveScheduler`), used as an SB3 learning-rate schedule.
+
+    SB3 calls the schedule at the start of every update; `AdaptiveLRCallback` updates `lr` from the
+    approx. KL of the previous update. Module-level so saved models unpickle.
+
+    Attributes:
+        lr: Current learning rate.
+        kl_threshold: Target KL.
+        min_lr: Lower bound.
+        max_lr: Upper bound.
+    """
+
+    def __init__(self, lr: float, kl_threshold: float, min_lr: float = 1e-6, max_lr: float = 1e-2) -> None:
+        """Store the initial rate and the bounds.
+
+        Args:
+            lr: Initial learning rate.
+            kl_threshold: Target KL.
+            min_lr: Lower bound.
+            max_lr: Upper bound.
+        """
+        self.lr, self.kl_threshold, self.min_lr, self.max_lr = float(lr), float(kl_threshold), min_lr, max_lr
+
+    def __call__(self, progress_remaining: float) -> float:
+        """Return the current rate (SB3 schedule interface; progress is ignored).
+
+        Args:
+            progress_remaining: 1 -> 0 over training.
+
+        Returns:
+            Learning rate.
+        """
+        return self.lr
+
+    def update(self, kl: float) -> None:
+        """Adapt the rate to the KL of the last update.
+
+        Args:
+            kl: Mean approx. KL of the last PPO update.
+        """
+        if kl > 2.0 * self.kl_threshold:
+            self.lr = max(self.lr / 1.5, self.min_lr)
+        elif kl < 0.5 * self.kl_threshold:
+            self.lr = min(self.lr * 1.5, self.max_lr)
+
+
+class AdaptiveLRCallback(BaseCallback):
+    """Feeds the last update's approx. KL into an `AdaptiveLR` schedule.
+
+    SB3 order per iteration: collect rollouts -> dump logs -> train (records train/approx_kl). The KL of
+    update k is therefore still in the logger at the start of rollout k+1, before update k+1 reads the rate.
+    """
+
+    def __init__(self, schedule: AdaptiveLR) -> None:
+        """Bind the schedule.
+
+        Args:
+            schedule: The schedule passed to the model as `learning_rate`.
+        """
+        super().__init__()
+        self.schedule = schedule
+        self._seen_updates = 0
+
+    def _on_rollout_start(self) -> None:
+        """Adapt the rate once per completed update."""
+        n = getattr(self.model, "_n_updates", 0)
+        kl = self.model.logger.name_to_value.get("train/approx_kl")
+        if n != self._seen_updates and kl is not None:
+            self.schedule.update(float(kl))
+            self._seen_updates = n
+
+    def _on_step(self) -> bool:
+        """No per-step work.
+
+        Returns:
+            True (continue training).
+        """
+        return True
 
 
 def split_overrides(raw: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
@@ -142,7 +236,7 @@ def split_overrides(raw: dict[str, str]) -> tuple[dict[str, str], dict[str, str]
     return train, env
 
 
-def build_model(cfg: TrainCfg, venv, tb_dir: Path, actor_dim: int | None = None):
+def build_model(cfg: TrainCfg, venv, tb_dir: Path, actor_dim: int | None = None, learning_rate: Any = None):
     """Instantiate the SB3 model.
 
     Args:
@@ -150,17 +244,22 @@ def build_model(cfg: TrainCfg, venv, tb_dir: Path, actor_dim: int | None = None)
         venv: Vectorized env.
         tb_dir: TensorBoard directory.
         actor_dim: Policy-part size of the observation (required when `cfg.asymmetric`).
+        learning_rate: Rate or schedule (default `cfg.learning_rate`), e.g. an `AdaptiveLR`.
 
     Returns:
         A `PPO` or `RecurrentPPO` model.
     """
     arch = list(cfg.net_arch)
+    if cfg.activation not in _ACTIVATIONS:
+        raise ValueError(f"unknown activation '{cfg.activation}' ({' | '.join(_ACTIVATIONS)})")
     common = dict(n_steps=cfg.n_steps, batch_size=cfg.batch_size, n_epochs=cfg.n_epochs,
-                  learning_rate=cfg.learning_rate, gamma=cfg.gamma, gae_lambda=cfg.gae_lambda,
-                  clip_range=cfg.clip_range, ent_coef=cfg.ent_coef, vf_coef=cfg.vf_coef,
+                  learning_rate=cfg.learning_rate if learning_rate is None else learning_rate,
+                  gamma=cfg.gamma, gae_lambda=cfg.gae_lambda, clip_range=cfg.clip_range,
+                  clip_range_vf=cfg.clip_range_vf or None, ent_coef=cfg.ent_coef, vf_coef=cfg.vf_coef,
                   max_grad_norm=cfg.max_grad_norm, target_kl=cfg.target_kl or None, seed=cfg.seed,
                   device=cfg.device, tensorboard_log=str(tb_dir), verbose=cfg.verbose)
-    pk = dict(net_arch=dict(pi=arch, vf=arch), log_std_init=cfg.log_std_init)
+    pk = dict(net_arch=dict(pi=arch, vf=arch), log_std_init=cfg.log_std_init,
+              activation_fn=_ACTIVATIONS[cfg.activation])
     if cfg.asymmetric:
         from mujoco_rl_bed.rl.asymmetric import AsymmetricActorCriticPolicy, AsymmetricRecurrentPolicy
 
@@ -178,7 +277,7 @@ def build_model(cfg: TrainCfg, venv, tb_dir: Path, actor_dim: int | None = None)
 
 
 # TrainCfg fields that define the network; they must match the run given by `init_from`.
-_ARCH_FIELDS = ("algo", "asymmetric", "net_arch", "lstm_hidden_size", "n_lstm_layers")
+_ARCH_FIELDS = ("algo", "asymmetric", "net_arch", "lstm_hidden_size", "n_lstm_layers", "activation")
 
 
 def resolve_init(cfg: TrainCfg, run_root: Path) -> tuple[Path, Path | None]:
@@ -196,7 +295,9 @@ def resolve_init(cfg: TrainCfg, run_root: Path) -> tuple[Path, Path | None]:
     src = _find_run(cfg.init_from, str(run_root))
     conf = json.loads((src / "config.json").read_text())["train"]
     mine = to_jsonable(cfg)
-    diff = [f"{k}: {conf.get(k)} (init_from) vs {mine[k]} (now)" for k in _ARCH_FIELDS if conf.get(k) != mine[k]]
+    defaults = to_jsonable(TrainCfg())  # fields added after the source run was made have their default
+    diff = [f"{k}: {conf.get(k, defaults[k])} (init_from) vs {mine[k]} (now)" for k in _ARCH_FIELDS
+            if conf.get(k, defaults[k]) != mine[k]]
     if diff:
         raise ValueError("init_from network mismatch; use the source run's settings:\n  " + "\n  ".join(diff))
     ckpt = Path(cfg.init_checkpoint) if cfg.init_checkpoint else Path("final_model.zip")
@@ -274,13 +375,17 @@ def main(argv: list[str], task_modules: Sequence[str] = (), defaults: dict[str, 
             venv = VecNormalize(venv, norm_obs=cfg.normalize_obs, norm_reward=cfg.normalize_reward, gamma=cfg.gamma)
 
     actor_dim = venv.get_attr("policy_obs_dim", indices=[0])[0]
-    model = build_model(cfg, venv, run_dir / "tb", actor_dim=actor_dim)
+    if cfg.lr_schedule not in ("constant", "adaptive"):
+        raise ValueError(f"lr_schedule must be 'constant' or 'adaptive', got '{cfg.lr_schedule}'")
+    schedule = AdaptiveLR(cfg.learning_rate, cfg.kl_threshold) if cfg.lr_schedule == "adaptive" else None
+    model = build_model(cfg, venv, run_dir / "tb", actor_dim=actor_dim, learning_rate=schedule)
     if init_ckpt is not None:
         # Weights + optimizer state; hyperparameters (n_steps, learning rate, ...) come from this run's cfg.
         model.set_parameters(str(init_ckpt), exact_match=True, device=model.device)
         print(f"[train] initialized from {init_ckpt} (vecnormalize: {init_vn})")
     callbacks = CallbackList([
         EpisodeInfoCallback(),
+        *([AdaptiveLRCallback(schedule)] if schedule is not None else []),
         CheckpointCallback(save_freq=max(1, cfg.checkpoint_every // cfg.n_envs), save_path=str(run_dir / "checkpoints"),
                            name_prefix="model", save_vecnormalize=isinstance(venv, VecNormalize)),
     ])
