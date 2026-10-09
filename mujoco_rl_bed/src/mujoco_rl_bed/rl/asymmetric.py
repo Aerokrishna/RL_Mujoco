@@ -18,6 +18,10 @@ Both extractors output the same size. sb3-contrib needs this: its critic LSTM's 
 size is the actor extractor's `features_dim`. Neither extractor has parameters, so replacing the
 critic extractor after construction leaves the optimizer untouched.
 
+`AsymmetricRecurrentPolicy` also replaces sb3-contrib's LSTM sequence processing with an exact, faster
+version (`fast_process_sequence`): sb3-contrib steps the LSTM one timestep at a time in Python whenever
+a minibatch contains an episode start, which with 150-step episodes is nearly every minibatch.
+
 Use via `TrainCfg.asymmetric=true` (see `mujoco_rl_bed.rl.train`); checkpoints store the
 policy class and `actor_dim`, so `eval.py` loads them unchanged.
 """
@@ -143,6 +147,34 @@ class AsymmetricActorCriticPolicy(ActorCriticPolicy):
         return data
 
 
+def fast_process_sequence(features: th.Tensor, lstm_states: tuple[th.Tensor, th.Tensor], episode_starts: th.Tensor,
+                          lstm: th.nn.LSTM) -> tuple[th.Tensor, tuple[th.Tensor, th.Tensor]]:
+    """LSTM forward over padded sequences, exact replacement of `RecurrentActorCriticPolicy._process_sequence`.
+
+    The recurrent rollout buffer cuts sequences at episode starts, so during gradient updates a start
+    can only be the first element of a sequence. Then resetting the initial state of those sequences
+    and running cuDNN over the whole sequence in one call gives the same result as sb3-contrib's
+    per-timestep Python loop. If a start appears later in a sequence, fall back to the original loop.
+
+    Args:
+        features: (n_seq * seq_len, input) batch, sequence-major as in sb3-contrib.
+        lstm_states: (h, c), each (n_layers, n_seq, hidden).
+        episode_starts: (n_seq * seq_len,) 1.0 where an episode starts.
+        lstm: The LSTM.
+
+    Returns:
+        (output (n_seq * seq_len, hidden), (h, c)).
+    """
+    n_seq = lstm_states[0].shape[1]
+    starts = episode_starts.reshape((n_seq, -1))
+    if starts.shape[1] > 1 and th.any(starts[:, 1:] != 0.0):
+        return RecurrentActorCriticPolicy._process_sequence(features, lstm_states, episode_starts, lstm)
+    keep = (1.0 - starts[:, 0]).view(1, n_seq, 1)
+    seq = features.reshape((n_seq, -1, lstm.input_size)).swapaxes(0, 1)
+    out, states = lstm(seq, (keep * lstm_states[0], keep * lstm_states[1]))
+    return th.flatten(out.transpose(0, 1), start_dim=0, end_dim=1), states
+
+
 class AsymmetricRecurrentPolicy(RecurrentActorCriticPolicy):
     """RecurrentPPO (LSTM) policy: actor LSTM gets the policy group, critic LSTM gets everything."""
 
@@ -176,3 +208,9 @@ class AsymmetricRecurrentPolicy(RecurrentActorCriticPolicy):
         data["actor_dim"] = self.actor_dim
         data["critic_sees_actor_obs"] = self.critic_sees_actor_obs
         return data
+
+    @staticmethod
+    def _process_sequence(features: th.Tensor, lstm_states: tuple[th.Tensor, th.Tensor], episode_starts: th.Tensor,
+                          lstm: th.nn.LSTM) -> tuple[th.Tensor, tuple[th.Tensor, th.Tensor]]:
+        """Exact, faster LSTM sequence processing (see `fast_process_sequence`)."""
+        return fast_process_sequence(features, lstm_states, episode_starts, lstm)

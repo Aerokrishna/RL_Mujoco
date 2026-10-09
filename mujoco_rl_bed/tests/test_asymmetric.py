@@ -114,3 +114,30 @@ def test_learn_save_load_roundtrip(which: int, tmp_path) -> None:
     a1, _ = model.predict(obs, deterministic=True)
     a2, _ = loaded.predict(obs, deterministic=True)
     np.testing.assert_allclose(a1, a2, atol=1e-6)
+
+
+@pytest.mark.parametrize("mid_start", [False, True])
+def test_fast_process_sequence_matches_sb3(mid_start: bool) -> None:
+    """The fused LSTM path gives the same outputs, states and gradients as sb3-contrib's loop."""
+    from sb3_contrib.common.recurrent.policies import RecurrentActorCriticPolicy
+
+    from mujoco_rl_bed.rl.asymmetric import fast_process_sequence
+
+    th.manual_seed(0)
+    lstm = th.nn.LSTM(5, 8, num_layers=2)
+    n_seq, seq_len = 4, 6
+    feats = th.randn(n_seq * seq_len, 5)
+    starts = th.zeros(n_seq, seq_len)
+    starts[1, 0] = starts[3, 0] = 1.0  # sequences that begin an episode
+    if mid_start:
+        starts[2, 3] = 1.0  # not produced by the buffer, but must still be handled (fallback)
+    starts = starts.flatten()
+    h0, c0 = th.randn(2, n_seq, 8), th.randn(2, n_seq, 8)
+    outs = []
+    for fn in (RecurrentActorCriticPolicy._process_sequence, fast_process_sequence):
+        lstm.zero_grad()
+        out, (h, c) = fn(feats, (h0, c0), starts, lstm)
+        (out.sum() + h.sum() + c.sum()).backward()
+        outs.append((out.detach(), h.detach(), c.detach(), lstm.weight_ih_l0.grad.clone()))
+    for a, b in zip(*outs):
+        th.testing.assert_close(a, b, atol=1e-5, rtol=1e-5)
