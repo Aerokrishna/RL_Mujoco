@@ -6,3 +6,5 @@ __pycache__/
 MUJOCO_LOG.TXT
 # system_check.py reports (machine-specific)
 system_check_*.json
+# benchmark outputs
+projects/benchmark/results/

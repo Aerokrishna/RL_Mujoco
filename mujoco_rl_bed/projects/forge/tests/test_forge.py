@@ -317,3 +317,17 @@ def test_policy_rate_from_task_env_defaults() -> None:
     assert env.cfg.decimation == 33 and env.ctx.max_episode_steps == 150
     assert env.cfg.policy_hz == pytest.approx(15.15, abs=0.01)
     assert make({"decimation": "25"}).cfg.decimation == 25
+
+
+def test_exact_horizontal_hole_error() -> None:
+    """pos_noise_xy shifts the hole estimate by exactly that distance, horizontally, in a seed-dependent direction."""
+    env = make({"obs_mode": "asymmetric", "task.events.reset_fixed.params.pos_noise_std": "0.0",
+                "task.events.reset_fixed.params.pos_noise_xy": "0.003"})
+    lay = dict(env.obs_mgr.layout["critic"])
+    dirs = []
+    for seed in range(4):
+        obs, _ = env.reset(seed=seed)
+        err = obs[env.policy_obs_dim:][lay["anchor_error_gt"]]
+        assert np.hypot(err[0], err[1]) == pytest.approx(0.003, abs=1e-6) and err[2] == pytest.approx(0.0, abs=1e-7)
+        dirs.append(np.arctan2(err[1], err[0]))
+    assert np.ptp(dirs) > 0.5

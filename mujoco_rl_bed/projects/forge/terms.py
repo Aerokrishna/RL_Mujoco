@@ -353,7 +353,8 @@ def forge_init(ctx: "Context", peg: str = "peg", hole: str = "hole", place_xy: f
 
 @event_term("forge_reset_fixed")
 def forge_reset_fixed(ctx: "Context", lo: tuple[float, float, float] = (0.55, -0.05, 0.0),
-                      hi: tuple[float, float, float] = (0.65, 0.05, 0.1), pos_noise_std: float = 0.0) -> None:
+                      hi: tuple[float, float, float] = (0.65, 0.05, 0.1), pos_noise_std: float = 0.0,
+                      pos_noise_xy: float = 0.0) -> None:
     """Reset: sample the socket pose and the policy's (optionally noisy) anchor.
 
     The anchor is the estimated hole tip raised by the TCP-to-peg-tip distance (see `ForgeState.anchor`).
@@ -363,6 +364,8 @@ def forge_reset_fixed(ctx: "Context", lo: tuple[float, float, float] = (0.55, -0
         lo: Lower corner of the socket base position [m] (paper Table II "Fixed").
         hi: Upper corner [m].
         pos_noise_std: Std of the per-episode hole-position estimate noise [m] (paper: 2.5 mm; v1: 0).
+        pos_noise_xy: Additional horizontal estimate error of exactly this size [m], random direction
+            (for controlled evaluation sweeps; 0 = none).
     """
     st = _st(ctx)
     st.reset_episode()
@@ -371,6 +374,10 @@ def forge_reset_fixed(ctx: "Context", lo: tuple[float, float, float] = (0.55, -0
     st.anchor[2] += st.tcp_to_tip  # reference = TCP pose with the peg tip at the opening
     if pos_noise_std > 0.0:
         st.anchor += ctx.rng.normal(0.0, pos_noise_std, size=3)
+    if pos_noise_xy > 0.0:
+        ang = ctx.rng.uniform(0.0, 2.0 * math.pi)
+        st.anchor[0] += pos_noise_xy * math.cos(ang)
+        st.anchor[1] += pos_noise_xy * math.sin(ang)
 
 
 @event_term("forge_reset_ee")
