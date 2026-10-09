@@ -25,8 +25,12 @@ Method details:
   lateral spring stiffness of its insertion phase (it has no z spring: the model commands the push force).
   Force noise is added to the sensed contact force at 1 kHz.
 
+`grid=full` replaces this table by all combinations of `kp_list` x `clearance_list` x `err_list`
+(force noise off, or on for all rows with `full_force_noise=true`).
+
 Usage (`conda activate dqn`, from `mujoco_rl_bed/`):
     python projects/benchmark/peg_benchmark.py                    # both methods, 10 episodes per condition
+    python projects/benchmark/peg_benchmark.py grid=full kp_list=600,400 err_list=0,0.5,1,2,3 clearance_list=0.5,1,0.25
     python projects/benchmark/peg_benchmark.py methods=forge episodes=2 workers=4
     python projects/benchmark/peg_benchmark.py mode=sanity        # privileged scripted expert, feasibility check
 
@@ -65,6 +69,11 @@ DEFAULTS = {
     "force_noise_mean": 0.5,                    # [N]
     "force_noise_var": 0.2,                     # [N^2]
     "f_th": 7.5,                                # FORGE force threshold input [N]
+    "grid": "ofat",                             # ofat: CONDITIONS below | full: all combinations of the lists
+    "kp_list": "600,400",                       # grid=full: stiffness levels [N/m]
+    "clearance_list": "0.5,1,0.25",             # grid=full: diametrical clearances [mm]
+    "err_list": "0,0.5,1,2,3",                  # grid=full: hole-estimate errors [mm]
+    "full_force_noise": False,                  # grid=full: force noise on in every row
 }
 
 NOMINAL = {"kp": 600.0, "clearance_mm": 0.5, "err_mm": 0.0, "force_noise": False}
@@ -73,6 +82,24 @@ CONDITIONS += [{**NOMINAL, "kp": k} for k in (400.0, 800.0)]
 CONDITIONS += [{**NOMINAL, "clearance_mm": c} for c in (1.0, 0.25)]
 CONDITIONS += [{**NOMINAL, "err_mm": e} for e in (1.0, 2.0, 3.0, 4.0)]
 CONDITIONS += [{**NOMINAL, "force_noise": True}]
+
+
+def build_conditions(cfg: dict) -> list[dict]:
+    """The condition list of this run.
+
+    Args:
+        cfg: Benchmark config.
+
+    Returns:
+        CONDITIONS (grid=ofat) or the full factorial of the lists (grid=full), ordered Kp, clearance, error.
+    """
+    if cfg["grid"] == "ofat":
+        return [dict(c) for c in CONDITIONS]
+    if cfg["grid"] != "full":
+        raise ValueError("grid must be 'ofat' or 'full'")
+    vals = {k: [float(x) for x in str(cfg[k]).split(",") if x] for k in ("kp_list", "clearance_list", "err_list")}
+    return [{"kp": k, "clearance_mm": c, "err_mm": e, "force_noise": bool(cfg["full_force_noise"])}
+            for k in vals["kp_list"] for c in vals["clearance_list"] for e in vals["err_list"]]
 
 PEG_RADIUS = 0.004
 
@@ -144,18 +171,18 @@ def _forge_policy(cfg: dict):
     return _CACHE["forge"]
 
 
-def run_forge(cond_idx: int, seed: int, cfg: dict) -> dict:
+def run_forge(cond_idx: int, cond: dict, seed: int, cfg: dict) -> dict:
     """One FORGE episode.
 
     Args:
-        cond_idx: Index into CONDITIONS.
+        cond_idx: Condition index (cache key / table row).
+        cond: Condition.
         seed: Reset seed.
         cfg: Benchmark config.
 
     Returns:
         Episode result.
     """
-    cond = CONDITIONS[cond_idx]
     model, mean, std, clip, n_obs = _forge_policy(cfg)
     key = ("forge_env", cond_idx)
     if key not in _CACHE:
@@ -205,11 +232,12 @@ def _tacdiff_module():
     return _CACHE["td_mod"]
 
 
-def run_tacdiff(cond_idx: int, seed: int, cfg: dict) -> dict:
+def run_tacdiff(cond_idx: int, cond: dict, seed: int, cfg: dict) -> dict:
     """One TacDiffusion episode.
 
     Args:
-        cond_idx: Index into CONDITIONS.
+        cond_idx: Condition index (cache key / table row).
+        cond: Condition.
         seed: Reset seed.
         cfg: Benchmark config.
 
@@ -217,7 +245,6 @@ def run_tacdiff(cond_idx: int, seed: int, cfg: dict) -> dict:
         Episode result.
     """
     td = _tacdiff_module()
-    cond = CONDITIONS[cond_idx]
     tcfg = dict(td.DEFAULTS)
     tcfg.update(model=cfg["tacdiff_model"], render=False, realtime=False, time_max=float(cfg["time_max"]),
                 xy_err=0.0, xy_err_from_env=True, lat_kp=float(cond["kp"]),
@@ -244,14 +271,14 @@ def _run(task: tuple) -> dict:
     """Worker entry point.
 
     Args:
-        task: (method, cond_idx, seed, cfg).
+        task: (method, cond_idx, cond, seed, cfg).
 
     Returns:
         Episode result.
     """
-    method, ci, seed, cfg = task
+    method, ci, cond, seed, cfg = task
     t0 = time.perf_counter()
-    r = (run_forge if method == "forge" else run_tacdiff)(ci, seed, cfg)
+    r = (run_forge if method == "forge" else run_tacdiff)(ci, cond, seed, cfg)
     r["wall_s"] = time.perf_counter() - t0
     return r
 
@@ -277,12 +304,13 @@ def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
     return (max(0.0, c - h), min(1.0, c + h))
 
 
-def summarize(rows: list[dict], methods: list[str]) -> tuple[list[str], list[list[str]]]:
+def summarize(rows: list[dict], methods: list[str], conditions: list[dict]) -> tuple[list[str], list[list[str]]]:
     """Per-condition table: condition columns + per method success (95% CI), time, F_mean, F_max.
 
     Args:
         rows: Episode results.
         methods: Methods in column order.
+        conditions: Condition list (table rows).
 
     Returns:
         (header, table rows as strings).
@@ -293,7 +321,7 @@ def summarize(rows: list[dict], methods: list[str]) -> tuple[list[str], list[lis
         header += [f"{names[m]} success (95% CI)", f"{names[m]} time [s]", f"{names[m]} F_mean [N]",
                    f"{names[m]} F_max [N]"]
     table = []
-    for ci, c in enumerate(CONDITIONS):
+    for ci, c in enumerate(conditions):
         line = [str(ci + 1), f"{c['kp']:.0f}", f"{c['clearance_mm']:g}", f"{c['err_mm']:g}",
                 "N(0.5, 0.2)" if c["force_noise"] else "off"]
         for m in methods:
@@ -381,8 +409,9 @@ def main(argv: list[str]) -> None:
     methods = [m for m in cfg["methods"].split(",") if m]
     if any(m not in ("tacdiff", "forge") for m in methods):
         raise ValueError("methods: comma list of tacdiff, forge")
-    tasks = [(m, ci, int(cfg["seed"]) + i, cfg) for i in range(int(cfg["episodes"]))
-             for ci in range(len(CONDITIONS)) for m in methods]
+    conds = build_conditions(cfg)
+    tasks = [(m, ci, conds[ci], int(cfg["seed"]) + i, cfg) for i in range(int(cfg["episodes"]))
+             for ci in range(len(conds)) for m in methods]
     t0 = time.perf_counter()
     rows = []
     with ProcessPoolExecutor(max_workers=int(cfg["workers"]), mp_context=mp.get_context("spawn")) as ex:
@@ -391,14 +420,14 @@ def main(argv: list[str]) -> None:
             print(f"[{len(rows):4d}/{len(tasks)}] {r['method']:7s} cond {r['cond'] + 1:2d} seed {r['seed']}  "
                   f"success={r['success']!s:5}  t={r['t']:6.2f}s  F_max={r['f_max']:5.1f}N  "
                   f"xy={r['xy_mm']:.2f}mm h={r['h_mm']:.1f}mm  ({r['wall_s']:.0f}s)", flush=True)
-    header, table = summarize(rows, methods)
+    header, table = summarize(rows, methods, conds)
     out = HERE / "results" / time.strftime("%Y%m%d-%H%M%S")
     out.mkdir(parents=True)
     with open(out / "summary.csv", "w", newline="") as f:
         csv.writer(f).writerows([header] + table)
     md = to_markdown(header, table)
     (out / "summary.md").write_text(md + "\n")
-    (out / "config.json").write_text(json.dumps({"cfg": cfg, "conditions": CONDITIONS}, indent=2))
+    (out / "config.json").write_text(json.dumps({"cfg": cfg, "conditions": conds}, indent=2))
     print("\n" + md)
     print(f"\n{len(rows)} episodes in {time.perf_counter() - t0:.0f} s -> {out}")
 
