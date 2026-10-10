@@ -90,7 +90,8 @@ class Peg:
         """
         half = 0.5 * self.length
         body = ee_body.add_body(name=self.name, pos=[0.0, 0.0, self.top_z + half])
-        body.add_geom(name=f"{self.name}_geom", type=mujoco.mjtGeom.mjGEOM_CYLINDER, size=[self.radius, half, 0],
+        gtype, gsize = self._shape(half)
+        body.add_geom(name=f"{self.name}_geom", type=gtype, size=gsize,
                       rgba=list(self.rgba), density=self.density, friction=[self.friction, 0.005, 0.0001],
                       solref=list(self.solref), solimp=list(self.solimp),
                       contype=PART_COLLISION_BIT, conaffinity=PART_COLLISION_BIT, condim=3)
@@ -100,6 +101,10 @@ class Peg:
             # kp0 at the tip (+half in body z, i.e. away from the hand), kp{n-1} at the top face.
             z = half - self.length * i / (n - 1)
             body.add_site(name=f"{self.name}_kp{i}", pos=[0, 0, z], size=[0.001, 0, 0], rgba=[1, 1, 0, 1], group=4)
+
+    def _shape(self, half: float) -> tuple[int, list[float]]:
+        """Geom type and size of the peg (cylinder of `radius`, half-length `half`)."""
+        return mujoco.mjtGeom.mjGEOM_CYLINDER, [self.radius, half, 0.0]
 
 
 @dataclass
@@ -183,6 +188,85 @@ class RoundHole:
             off = a + hx
             body.add_geom(name=f"{self.name}_block{k}", type=mujoco.mjtGeom.mjGEOM_BOX,
                           size=[size[0], size[1], 0.5 * self.depth], pos=[sx * off, sy * off, z_mid], **common)
+        body.add_site(name=f"{self.name}_tip", pos=[0, 0, bt + self.depth], size=[0.0015, 0, 0],
+                      rgba=[0, 1, 0, 1], group=4)
+        body.add_site(name=f"{self.name}_floor", pos=[0, 0, bt], size=[0.0015, 0, 0], rgba=[0, 0, 1, 1], group=4)
+
+
+@dataclass
+class BoxPeg(Peg):
+    """Cuboid peg (rectangular cross-section) rigidly attached to the end-effector body.
+
+    Same frame, sites and keypoints as `Peg` (axis = `ee_body` z, `<name>_tip` at the bottom-face centre);
+    the cross-section is `2 half_x` x `2 half_y` along the `ee_body` x and y axes. `radius` is unused.
+
+    Attributes:
+        half_x: Cross-section half-size along the `ee_body` x axis [m] (8 mm -> 0.004).
+        half_y: Cross-section half-size along the `ee_body` y axis [m].
+    """
+
+    half_x: float = 0.004
+    half_y: float = 0.004
+
+    def _shape(self, half: float) -> tuple[int, list[float]]:
+        """Geom type and size of the peg (box of half-sizes `half_x`, `half_y`, `half`)."""
+        return mujoco.mjtGeom.mjGEOM_BOX, [self.half_x, self.half_y, half]
+
+
+@dataclass
+class RectHole:
+    """Solid square socket block with a rectangular hole, on a mocap body (moved by events at reset).
+
+    The hole (`2 inner_half_x` x `2 inner_half_y`, along the body x and y axes) is the gap between four slabs:
+    the +-x slabs span the full block in y, the +-y slabs fill between them. Same sites and body layout as
+    `RoundHole`: `<name>_tip` (centre of the opening = top of the block), `<name>_floor` (centre of the hole
+    bottom); the body origin is the bottom of the base plate. Rotate the hole with the mocap orientation.
+
+    Attributes:
+        name: Body name.
+        inner_half_x: Hole half-size along the body x axis [m] (8 mm peg + 0.5 mm clearance -> 0.00425).
+        inner_half_y: Hole half-size along the body y axis [m].
+        depth: Hole depth [m].
+        base_thickness: Base plate thickness under the hole [m].
+        block_half_size: Half extent of the block (and base plate) in x and y [m].
+        friction: Sliding friction coefficient.
+        solref: Contact solref.
+        solimp: Contact solimp (dmin, dmax, width, midpoint, power).
+        rgba: Color.
+    """
+
+    name: str = "hole"
+    inner_half_x: float = 0.00425
+    inner_half_y: float = 0.00425
+    depth: float = 0.025
+    base_thickness: float = 0.005
+    block_half_size: float = 0.03
+    friction: float = 0.75
+    solref: tuple[float, float] = (0.004, 1.0)
+    solimp: tuple[float, float, float, float, float] = (0.95, 0.99, 0.0005, 0.5, 2.0)
+    rgba: tuple[float, float, float, float] = (0.6, 0.6, 0.65, 1.0)
+
+    def build(self, spec: mujoco.MjSpec, ee_body: mujoco.MjsBody) -> None:
+        """Add the socket to the world as a mocap body.
+
+        Args:
+            spec: Scene spec.
+            ee_body: End-effector body spec (unused).
+        """
+        common = dict(friction=[self.friction, 0.005, 0.0001], solref=list(self.solref), solimp=list(self.solimp),
+                      contype=PART_COLLISION_BIT, conaffinity=PART_COLLISION_BIT, condim=3, rgba=list(self.rgba))
+        body = spec.worldbody.add_body(name=self.name, mocap=True, pos=[0.6, 0.0, 0.05])
+        bt, H, ix, iy = self.base_thickness, self.block_half_size, self.inner_half_x, self.inner_half_y
+        if H <= max(ix, iy):
+            raise ValueError("block_half_size must exceed the hole half-sizes")
+        body.add_geom(name=f"{self.name}_base", type=mujoco.mjtGeom.mjGEOM_BOX,
+                      size=[H, H, 0.5 * bt], pos=[0, 0, 0.5 * bt], **common)
+        z_mid = bt + 0.5 * self.depth
+        hx, hy = 0.5 * (H - ix), 0.5 * (H - iy)
+        for k, (pos, size) in enumerate([((ix + hx, 0.0), (hx, H)), ((-(ix + hx), 0.0), (hx, H)),
+                                         ((0.0, iy + hy), (ix, hy)), ((0.0, -(iy + hy)), (ix, hy))]):
+            body.add_geom(name=f"{self.name}_block{k}", type=mujoco.mjtGeom.mjGEOM_BOX,
+                          size=[size[0], size[1], 0.5 * self.depth], pos=[pos[0], pos[1], z_mid], **common)
         body.add_site(name=f"{self.name}_tip", pos=[0, 0, bt + self.depth], size=[0.0015, 0, 0],
                       rgba=[0, 1, 0, 1], group=4)
         body.add_site(name=f"{self.name}_floor", pos=[0, 0, bt], size=[0.0015, 0, 0], rgba=[0, 0, 1, 1], group=4)

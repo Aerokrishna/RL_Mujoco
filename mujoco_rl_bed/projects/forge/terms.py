@@ -164,7 +164,8 @@ class ForgeState:
         self.success_dist = success_dist
         self.p_term = float(p_term)
         # Controller parameters of the episode (overwritten by the randomization events if enabled).
-        self.kp = np.asarray(ctx.controller.kp_nominal, dtype=np.float64).copy()
+        # (controllers without Cartesian gains, e.g. `AxisCompliance`, report zeros)
+        self.kp = np.asarray(getattr(ctx.controller, "kp_nominal", np.zeros(6)), dtype=np.float64).copy()
         self.lam = ctx.state["action_max_step"]  # owned by the action term (shape (3,))
         self.ema = ctx.state["action_ema"]
         self.dead_zone = np.zeros(6)

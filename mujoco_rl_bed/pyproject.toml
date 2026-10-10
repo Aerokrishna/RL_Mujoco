@@ -24,7 +24,7 @@ dev = ["pytest>=7"]
 [tool.setuptools.packages.find]
 # Core framework in src/, research projects (e.g. projects/forge -> `import forge`) in projects/.
 where = ["src", "projects"]
-include = ["mujoco_rl_bed*", "forge*"]
+include = ["mujoco_rl_bed*", "forge*", "compliant_RL*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "projects"]

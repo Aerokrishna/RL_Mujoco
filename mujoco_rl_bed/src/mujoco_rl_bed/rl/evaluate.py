@@ -41,6 +41,8 @@ class EvalCfg:
         checkpoint: Model zip, relative to `run` (default final_model.zip) or absolute.
         policy: "checkpoint" or "scripted" (needs a `scripted_factory` from the caller).
         task: Task name (only needed without `run`).
+        eval_task: Evaluate a `run` on this task instead of its training task (same observation and action
+            sizes required), e.g. a different part geometry. Empty = the run's task.
         episodes: Number of episodes.
         seed: First episode seed (episode i uses seed + i).
         deterministic: Use the policy mean.
@@ -54,6 +56,7 @@ class EvalCfg:
     checkpoint: str = ""
     policy: str = "checkpoint"
     task: str = ""
+    eval_task: str = ""
     episodes: int = 10
     seed: int = 1000
     deterministic: bool = True
@@ -206,6 +209,8 @@ def main(argv: list[str], task_modules: Sequence[str] = (), defaults: dict[str, 
         algo, task = conf["train"]["algo"], conf["train"]["task"]
         import_task_modules(conf.get("task_modules", []))
         env_ov = {**conf.get("env_overrides", {}), **env_ov}
+    if cfg.eval_task:
+        task = cfg.eval_task
     if not task:
         raise ValueError("Give run=<dir> or task=<name>")
     env_ov.update({"render": str(cfg.render).lower(), "realtime": str(cfg.realtime).lower()})
