@@ -1,0 +1,57 @@
+# Peg-in-hole comparison config for `projects/benchmark/compare.py`.
+#
+# Every combination of the `conditions` lists is one condition; every method runs the same `episodes` reset seeds
+# (seed, seed + 1, ...) in every condition, so socket poses, error directions, tilt directions and friction draws are
+# identical across methods. Any key can be overridden on the command line with dotted keys, e.g.
+#   python projects/benchmark/compare.py episodes=5 conditions.shapes=[cylinder] methods=[spiral,spiral_rl]
+
+# spiral      scripted spiral search on the axis compliance controller (zero residual)
+# spiral_rule spiral + scripted catch rule (|F_xy| > 3.5 N for 3 steps -> try insert for 0.6 s)
+# spiral_rl   spiral + learned catch policy (LSTM, `models.spiral_rl_run`)
+# forge       FORGE policy (`models.forge_run`)
+# tacdiff     TacDiffusion, the authors' model (`models.tacdiff_model`), via projects/tacdiff/run.py
+methods: [spiral, spiral_rule, spiral_rl, forge, tacdiff]
+
+episodes: 20            # per method and condition
+seed: 2000              # first reset seed
+time_max: 20.0          # [s] per episode from the method's start
+workers: 10             # parallel processes (one (method, condition) job each); keep <= CPU cores - 1
+
+conditions:
+  shapes: [cuboid]   # 8 mm across (diameter / side / across flats), 25 mm deep hole cylinder, cuboid, hexagon, 
+  clearance_mm: [0.25]  # radial clearance per side [mm]
+  hole_error_mm: ["0-4"]  # hole-position estimate error [mm], random direction: "a" exactly a, "a-b" U(a, b)
+  tilt_deg: ["6-8"]     # arm tilt against the socket normal [deg], random axis: "a" or "a-b"
+  friction: ["0.5"]     # peg/hole sliding friction: "a" or "a-b" (U per episode)
+
+peg_half_size_mm: 4.0   # peg radius / half side / apothem
+
+# TacDiffusion-paper hole-pose error on top of the conditions: U(+-tol_mm) in x, y and U(+-tol_deg) in roll, pitch, yaw.
+paper_error: {enabled: false, tol_mm: 2.0, tol_deg: 2.0}
+
+models:
+  forge_run: projects/forge/runs/jitter_but_works                                 # relative to mujoco_rl_bed/
+  spiral_rl_run: projects/compliant_RL/runs/compliant_peg_s2g_20261012-122716_s0_s2g_bc
+  spiral_rl_checkpoint: final_model.zip                                           # or checkpoints/model_<N>_steps.zip
+  tacdiff_model: ../diffusion/TacDiffusion/output/TacDiffusion_model_512.onnx
+
+# Spiral base shared by spiral, spiral_rule and spiral_rl (the RL policy was trained with these values).
+spiral:
+  f_search_n: 1.5       # push during approach and search [N]
+  pitch_mm: 0.5         # ring spacing (0.6 covers better but takes longer)
+  r_max_mm: 3.6         # search radius; keep it ~0.6 mm above the largest hole error
+  speed_mm_s: 10.0
+
+forge:
+  f_th: 7.5             # contact-force threshold the policy is conditioned on [N]
+  deterministic: false  # the checkpoint was trained (and only works) with sampled actions
+  ema: 1.0              # position EMA factor (1 = none)
+
+# Viewer: run one method in the MuJoCo viewer, condition by condition (workers = 1, nothing is saved).
+view:
+  enabled: true
+  method: spiral_rule
+  realtime: true
+  pause_s: 1.0          # hold the final pose this long after each episode
+
+out: ""                 # results folder; empty = projects/benchmark/results/compare_<time>. An existing folder resumes.

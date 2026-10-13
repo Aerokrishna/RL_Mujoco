@@ -1,0 +1,44 @@
+# Config of the comparison reported in `benchmark_comparisons.md` (see compare.yaml for what every key means).
+# Run:  python projects/benchmark/compare.py config=projects/benchmark/benchmark_comparison.yaml
+methods: [spiral_rl, forge, tacdiff]
+
+episodes: 20
+seed: 2000
+time_max: 20.0
+workers: 11
+
+conditions:
+  shapes: [cylinder, cuboid, octagon]
+  clearance_mm: [0.25, 0.5]
+  hole_error_mm: ["2", "4"]     # exactly 2 / 4 mm, random direction
+  tilt_deg: ["0", "5"]          # exactly 0 / 5 deg, random axis
+  friction: ["0.4", "0.7"]
+
+peg_half_size_mm: 4.0
+
+paper_error: {enabled: false, tol_mm: 2.0, tol_deg: 2.0}
+
+models:
+  forge_run: projects/forge/runs/jitter_but_works
+  spiral_rl_run: projects/compliant_RL/runs/compliant_peg_s2g_20261012-122716_s0_s2g_bc
+  spiral_rl_checkpoint: final_model.zip
+  tacdiff_model: ../diffusion/TacDiffusion/output/TacDiffusion_model_256.onnx   # authors' 256 model (512: 45 ms/call here, 256: 14 ms)
+
+spiral:
+  f_search_n: 1.5
+  pitch_mm: 0.8
+  r_max_mm: 4.6
+  speed_mm_s: 10.0
+
+forge:
+  f_th: 7.5
+  deterministic: false
+  ema: 1.0
+
+view:
+  enabled: false
+  method: spiral_rl
+  realtime: true
+  pause_s: 1.0
+
+out: projects/benchmark/results/benchmark_comparison

@@ -1,7 +1,6 @@
 # Editor state
 .vscode/
-# Separate clone of the TacDiffusion repo (own .git, ~1.4 GB dataset): clone it separately
-diffusion/
+# diffusion/TacDiffusion is a git submodule (the authors' repo; its untracked dataset is ignored in .gitmodules)
 # Python
 __pycache__/
 *.pyc

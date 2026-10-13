@@ -1,0 +1,14 @@
+# Exact versions the benchmark results were produced with (Python 3.10). Install with
+#   pip install -r requirements-lock.txt && pip install -e ".[tacdiff,dev]"
+# For a CPU-only machine install torch first from the CPU index (much smaller):
+#   pip install torch==2.14.0 --index-url https://download.pytorch.org/whl/cpu
+mujoco==3.10.0
+numpy==2.2.6
+gymnasium==1.2.0
+stable-baselines3==2.9.0
+sb3-contrib==2.9.0
+torch==2.14.0
+tensorboard==2.19.0
+pyyaml==6.0.2
+onnxruntime==1.23.2
+pytest==9.1.1

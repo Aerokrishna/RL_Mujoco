@@ -1,0 +1,4 @@
+[submodule "diffusion/TacDiffusion"]
+	path = diffusion/TacDiffusion
+	url = https://github.com/popnut123/TacDiffusion.git
+	ignore = untracked

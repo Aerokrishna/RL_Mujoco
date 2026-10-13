@@ -15,7 +15,7 @@ built on the `mujoco_rl_bed` core (torque-controlled Franka, Cartesian impedance
 Reusable MuJoCo pieces live in the core: `Peg`/`RoundHole` assets (`mujoco_rl_bed.sim.assets`),
 reset IK (`mujoco_rl_bed.sim.ik`), the `anchor_relative_pos` action term.
 
-## Usage (`conda activate dqn`, from any directory; full reference in `commands.md`)
+## Usage (`conda activate mjtest`, from any directory; full reference in `../../commands.md`)
 
 ```bash
 python scripts/system_check.py                     # (from mujoco_rl_bed/) machine check before a long run

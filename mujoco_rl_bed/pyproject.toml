@@ -10,16 +10,18 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
-    "mujoco>=3.10",
+    "mujoco==3.10.0",          # pinned: 3.15 changes contact forces 3-4x in the peg tasks (all results use 3.10.0)
     "gymnasium>=1.0",
     "stable-baselines3>=2.3",
     "torch>=2.0",
     "sb3-contrib>=2.3",
     "tensorboard>=2.10",
+    "pyyaml>=6",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest>=7"]
+tacdiff = ["onnxruntime>=1.16"]   # TacDiffusion (authors' ONNX models) in the benchmark
 
 [tool.setuptools.packages.find]
 # Core framework in src/, research projects (e.g. projects/forge -> `import forge`) in projects/.

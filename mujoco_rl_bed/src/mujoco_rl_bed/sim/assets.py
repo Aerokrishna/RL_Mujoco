@@ -90,11 +90,11 @@ class Peg:
         """
         half = 0.5 * self.length
         body = ee_body.add_body(name=self.name, pos=[0.0, 0.0, self.top_z + half])
-        gtype, gsize = self._shape(half)
-        body.add_geom(name=f"{self.name}_geom", type=gtype, size=gsize,
-                      rgba=list(self.rgba), density=self.density, friction=[self.friction, 0.005, 0.0001],
-                      solref=list(self.solref), solimp=list(self.solimp),
-                      contype=PART_COLLISION_BIT, conaffinity=PART_COLLISION_BIT, condim=3)
+        for i, (gtype, gsize, quat) in enumerate(self._geoms(half)):
+            body.add_geom(name=f"{self.name}_geom" + (str(i) if i else ""), type=gtype, size=gsize, quat=quat,
+                          rgba=list(self.rgba), density=self.density, friction=[self.friction, 0.005, 0.0001],
+                          solref=list(self.solref), solimp=list(self.solimp),
+                          contype=PART_COLLISION_BIT, conaffinity=PART_COLLISION_BIT, condim=3)
         body.add_site(name=f"{self.name}_tip", pos=[0, 0, half], size=[0.0015, 0, 0], rgba=[1, 0, 0, 1], group=4)
         n = max(2, self.n_keypoints)
         for i in range(n):
@@ -105,6 +105,11 @@ class Peg:
     def _shape(self, half: float) -> tuple[int, list[float]]:
         """Geom type and size of the peg (cylinder of `radius`, half-length `half`)."""
         return mujoco.mjtGeom.mjGEOM_CYLINDER, [self.radius, half, 0.0]
+
+    def _geoms(self, half: float) -> list[tuple[int, list[float], list[float]]]:
+        """Collision geoms of the peg body: (type, size, quat) each; one geom of `_shape` by default."""
+        gtype, gsize = self._shape(half)
+        return [(gtype, gsize, [1.0, 0.0, 0.0, 0.0])]
 
 
 @dataclass
@@ -214,6 +219,34 @@ class BoxPeg(Peg):
 
 
 @dataclass
+class HexPeg(Peg):
+    """Regular-prism peg (hexagon by default, any even number of sides) rigidly attached to the end-effector body.
+
+    Same frame, sites and keypoints as `Peg`. The prism is the union of `n_sides` / 2 boxes of half-sizes
+    (`apothem`, side / 2, length / 2) turned by k 360° / `n_sides` about the peg axis (each box spans two opposite
+    flats and its corners are polygon vertices, so the union is exactly the polygon). Flat normals point along
+    k 360° / `n_sides` from the `ee_body` x axis, matching `HexHole` / `RoundHole(n_walls=n_sides)`. `radius` is unused.
+
+    Attributes:
+        apothem: Centre-to-flat distance [m] (8 mm across flats -> 0.004).
+        n_sides: Number of sides (even; 6 = hexagon, 8 = octagon).
+    """
+
+    apothem: float = 0.004
+    n_sides: int = 6
+
+    def _geoms(self, half: float) -> list[tuple[int, list[float], list[float]]]:
+        """`n_sides` / 2 boxes forming the prism."""
+        n = int(self.n_sides)
+        if n < 4 or n % 2:
+            raise ValueError("HexPeg.n_sides must be even and >= 4")
+        side = 2.0 * self.apothem * math.tan(math.pi / n)
+        size = [self.apothem, 0.5 * side, half]
+        return [(mujoco.mjtGeom.mjGEOM_BOX, size, [math.cos(math.pi * k / n), 0.0, 0.0, math.sin(math.pi * k / n)])
+                for k in range(n // 2)]
+
+
+@dataclass
 class RectHole:
     """Solid square socket block with a rectangular hole, on a mocap body (moved by events at reset).
 
@@ -270,3 +303,14 @@ class RectHole:
         body.add_site(name=f"{self.name}_tip", pos=[0, 0, bt + self.depth], size=[0.0015, 0, 0],
                       rgba=[0, 1, 0, 1], group=4)
         body.add_site(name=f"{self.name}_floor", pos=[0, 0, bt], size=[0.0015, 0, 0], rgba=[0, 0, 1, 1], group=4)
+
+
+@dataclass
+class HexHole(RoundHole):
+    """Solid socket block with a regular hexagonal hole: a `RoundHole` with six wall boxes.
+
+    `inner_radius` is the hole apothem (centre-to-flat distance); flat normals point along 0, 60, 120, ... ° from
+    the body x axis, matching `HexPeg`. Rotate the hole with the mocap orientation.
+    """
+
+    n_walls: int = 6
