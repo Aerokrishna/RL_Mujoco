@@ -80,13 +80,21 @@ def collect(task: str, n: int, n_ep: int, seed: int, gamma: float, no_try: float
 
 def train_bc(pol, eps: list, epochs: int, w_pos: float, discrete: bool) -> float:
     """Fit the actor to the rule actions (Gaussian mean, or push/no-push logits when `discrete`) and the critic to the
-    returns (episodes of equal length)."""
+    returns. Episodes are zero-padded to the longest one and the padding is masked out of the losses (an episode
+    that ends early, e.g. on the `unstable` termination, must not truncate the others)."""
     import torch as th
 
-    T = min(len(e[0]) for e in eps)
-    Xo = th.tensor(np.stack([e[0][:T] for e in eps]))
-    Xa = th.tensor(np.stack([e[1][:T] for e in eps]), dtype=th.float32)[..., None]
-    Xg = th.tensor(np.stack([e[2][:T] for e in eps]), dtype=th.float32)[..., None]
+    lens = np.array([len(e[0]) for e in eps])
+    T = int(lens.max())
+    print(f"[bc] {len(eps)} episodes, length {lens.min()}-{T} steps ({int((lens < T).sum())} ended early)", flush=True)
+
+    def pad(x):
+        return np.concatenate([x, np.zeros((T - len(x),) + x.shape[1:], dtype=np.float32)])
+
+    Xo = th.tensor(np.stack([pad(e[0]) for e in eps]))
+    Xa = th.tensor(np.stack([pad(np.asarray(e[1], dtype=np.float32)) for e in eps]))[..., None]
+    Xg = th.tensor(np.stack([pad(np.asarray(e[2], dtype=np.float32)) for e in eps]))[..., None]
+    Xm = th.tensor(np.stack([np.arange(T) < n for n in lens]), dtype=th.float32)[..., None]   # 1 = real step
     params = [p for name, p in pol.named_parameters() if name != "log_std"]
     opt = th.optim.Adam(params, lr=1e-3)
     H = pol.lstm_actor.hidden_size
@@ -102,10 +110,11 @@ def train_bc(pol, eps: list, epochs: int, w_pos: float, discrete: bool) -> float
         return mean.reshape(B, T, -1), val.reshape(B, T, 1)
 
     def actor_loss(out, a, w):
+        """Weighted, masked (w = 0 on padding) imitation loss."""
         if discrete:                                      # out: logits (B, T, 2), a: 0 / 1
             ce = th.nn.functional.cross_entropy(out.reshape(-1, 2), a.reshape(-1).long(), reduction="none")
-            return (w.reshape(-1) * ce).mean()
-        return (w * (out - a) ** 2).mean()
+            return (w.reshape(-1) * ce).sum() / w.sum()
+        return (w * (out - a) ** 2).sum() / w.sum()
 
     E = len(Xo)
     n_val = max(E // 10, 1)
@@ -115,8 +124,9 @@ def train_bc(pol, eps: list, epochs: int, w_pos: float, discrete: bool) -> float
         for k in range(0, len(tr), 16):
             b = tr[k:k + 16]
             mean, val = forward(Xo[b])
-            w = 1.0 + (w_pos - 1.0) * (Xa[b] > 0).float()
-            loss = actor_loss(mean, Xa[b], w) + 0.5 * ((val - Xg[b]) ** 2).mean()
+            m = Xm[b]
+            w = (1.0 + (w_pos - 1.0) * (Xa[b] > 0).float()) * m
+            loss = actor_loss(mean, Xa[b], w) + 0.5 * (m * (val - Xg[b]) ** 2).sum() / m.sum()
             opt.zero_grad()
             loss.backward()
             th.nn.utils.clip_grad_norm_(params, 1.0)
@@ -124,10 +134,12 @@ def train_bc(pol, eps: list, epochs: int, w_pos: float, discrete: bool) -> float
         if ep % 10 == 9 or ep == epochs - 1:
             with th.no_grad():
                 mean, val = forward(Xo[va])
-                pred = mean[..., 1:] > mean[..., :1] if discrete else mean > 0.3
-                lab = Xa[va] > 0
+                m = Xm[va] > 0
+                pred = (mean[..., 1:] > mean[..., :1] if discrete else mean > 0.3) & m
+                lab = (Xa[va] > 0) & m
                 tp = float((pred & lab).sum())
-                r2 = 1 - float(((val - Xg[va]) ** 2).mean() / Xg[va].var())
+                g, v = Xg[va][m], val[m]
+                r2 = 1 - float(((v - g) ** 2).mean() / g.var())
                 recall = tp / max(float(lab.sum()), 1)
                 print(f"epoch {ep + 1}: held-out try recall {recall:.2f}, precision "
                       f"{tp / max(float(pred.sum()), 1):.2f}, value R2 {r2:.2f}", flush=True)
