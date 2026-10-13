@@ -18,7 +18,8 @@ Usage (`conda activate dqn`, from `mujoco_rl_bed/`):
 
 Keys (defaults in brackets): task [compliant_peg_s2g], run_name [s2g_bc], n_envs [10], episodes_per_env [30],
 epochs [40], seed [5000], gamma [0.995], net_arch [[64,64]], lstm_hidden_size [128], log_std_init [-1.5],
-no_try [-0.3; 0 for a binary action], w_pos [5].
+no_try [-0.3; 0 for a binary action], w_pos [5; 50 for a binary action: push onsets are ~0.3 % of the steps (a push
+mostly ends within 1-2 steps when the peg drops), and at 5x the classifier learnt never to push (recall 0)].
 The network keys must match the later PPO run (`train.py` checks them for `init_from`).
 """
 
@@ -32,7 +33,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 DEFAULTS = {"task": "compliant_peg_s2g", "run_name": "s2g_bc", "n_envs": 10, "episodes_per_env": 30, "epochs": 40,
             "seed": 5000, "gamma": 0.995, "net_arch": "[64,64]", "lstm_hidden_size": 128, "log_std_init": -1.5,
-            "no_try": -0.3, "w_pos": 5.0}
+            "no_try": -0.3, "w_pos": "auto"}
 
 
 def collect(task: str, n: int, n_ep: int, seed: int, gamma: float, no_try: float, pd: int, phase_idx: int,
@@ -77,7 +78,7 @@ def collect(task: str, n: int, n_ep: int, seed: int, gamma: float, no_try: float
     return eps, venv
 
 
-def train_bc(pol, eps: list, epochs: int, w_pos: float, discrete: bool) -> None:
+def train_bc(pol, eps: list, epochs: int, w_pos: float, discrete: bool) -> float:
     """Fit the actor to the rule actions (Gaussian mean, or push/no-push logits when `discrete`) and the critic to the
     returns (episodes of equal length)."""
     import torch as th
@@ -127,8 +128,10 @@ def train_bc(pol, eps: list, epochs: int, w_pos: float, discrete: bool) -> None:
                 lab = Xa[va] > 0
                 tp = float((pred & lab).sum())
                 r2 = 1 - float(((val - Xg[va]) ** 2).mean() / Xg[va].var())
-                print(f"epoch {ep + 1}: held-out try recall {tp / max(float(lab.sum()), 1):.2f}, precision "
+                recall = tp / max(float(lab.sum()), 1)
+                print(f"epoch {ep + 1}: held-out try recall {recall:.2f}, precision "
                       f"{tp / max(float(pred.sum()), 1):.2f}, value R2 {r2:.2f}", flush=True)
+    return recall
 
 
 def main(argv: list[str]) -> None:
@@ -160,7 +163,11 @@ def main(argv: list[str]) -> None:
           f"phase index {phase_idx}", flush=True)
     eps, venv = collect(a["task"], int(a["n_envs"]), int(a["episodes_per_env"]), int(a["seed"]), float(a["gamma"]),
                         0.0 if discrete else float(a["no_try"]), model.policy.actor_dim, phase_idx, discrete)
-    train_bc(model.policy, eps, int(a["epochs"]), float(a["w_pos"]), discrete)
+    w_pos = (50.0 if discrete else 5.0) if a["w_pos"] == "auto" else float(a["w_pos"])
+    recall = train_bc(model.policy, eps, int(a["epochs"]), w_pos, discrete)
+    if recall < 0.7:
+        print(f"[bc] WARNING: held-out try recall {recall:.2f} < 0.7: the warm start does not imitate the rule; "
+              f"raise w_pos (now {w_pos:g}) or epochs before fine-tuning", flush=True)
     model.save(str(run / "final_model.zip"))
     venv.save(str(run / "vecnormalize.pkl"))
     venv.close()
