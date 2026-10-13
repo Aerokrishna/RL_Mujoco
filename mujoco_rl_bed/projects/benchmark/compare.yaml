@@ -3,14 +3,13 @@
 # Every combination of the `conditions` lists is one condition; every method runs the same `episodes` reset seeds
 # (seed, seed + 1, ...) in every condition, so socket poses, error directions, tilt directions and friction draws are
 # identical across methods. Any key can be overridden on the command line with dotted keys, e.g.
-#   python projects/benchmark/compare.py episodes=5 conditions.shapes=[cylinder] methods=[spiral,spiral_rl]
+#   python projects/benchmark/compare.py episodes=5 conditions.shapes=[cylinder] methods=[spiral_rule,forge]
 
-# spiral      scripted spiral search on the axis compliance controller (zero residual)
-# spiral_rule spiral + scripted catch rule (|F_xy| > 3.5 N for 3 steps -> try insert for 0.6 s)
-# spiral_rl   spiral + learned catch policy (LSTM, `models.spiral_rl_run`)
+# spiral_rule scripted spiral search on the axis compliance controller + catch rule (|F_xy| > 3.5 N for 3 steps ->
+#             try insert for 0.6 s)
 # forge       FORGE policy (`models.forge_run`)
 # tacdiff     TacDiffusion, the authors' model (`models.tacdiff_model`), via projects/tacdiff/run.py
-methods: [spiral, spiral_rule, spiral_rl, forge, tacdiff]
+methods: [spiral_rule, forge, tacdiff]
 
 episodes: 20            # per method and condition
 seed: 2000              # first reset seed
@@ -31,11 +30,9 @@ paper_error: {enabled: false, tol_mm: 2.0, tol_deg: 2.0}
 
 models:
   forge_run: projects/forge/runs/jitter_but_works                                 # relative to mujoco_rl_bed/
-  spiral_rl_run: projects/compliant_RL/runs/compliant_peg_s2g_20261012-122716_s0_s2g_bc
-  spiral_rl_checkpoint: final_model.zip                                           # or checkpoints/model_<N>_steps.zip
   tacdiff_model: ../diffusion/TacDiffusion/output/TacDiffusion_model_512.onnx
 
-# Spiral base shared by spiral, spiral_rule and spiral_rl (the RL policy was trained with these values).
+# Spiral base of spiral_rule.
 spiral:
   f_search_n: 1.5       # push during approach and search [N]
   pitch_mm: 0.5         # ring spacing (0.6 covers better but takes longer)

@@ -1,4 +1,4 @@
-"""Peg-in-hole comparison: spiral search (plain, scripted catch rule, learned catch policy), FORGE and TacDiffusion.
+"""Peg-in-hole comparison: spiral search with the scripted catch rule, FORGE and TacDiffusion.
 
 All settings live in a YAML config (default `compare.yaml` next to this file); see its comments for every key.
 Every combination of the condition lists (shape x clearance x hole error x tilt x friction) is one condition, and
@@ -16,14 +16,14 @@ Common to all methods:
   F_max = max of the 50 ms moving average of the peg contact force (after a 3-tick median that removes one-tick
   collision glitches). Outcome of a failure: `jammed` (tip got into the hole) or `not_found`.
 
-Method start: spiral*: tip 2 mm above the estimated opening; FORGE: its reset pose 3.7-5.7 cm above the hole;
+Method start: spiral_rule: tip 2 mm above the estimated opening; FORGE: its reset pose 3.7-5.7 cm above the hole;
 TacDiffusion: the FORGE reset pose, then its scripted approach, guarded descent and diffusion phase (all within
 `time_max`).
 
-Usage (`conda activate dqn`, from `mujoco_rl_bed/`):
+Usage (`conda activate mjtest`, from `mujoco_rl_bed/`):
     python projects/benchmark/compare.py                                     # everything in compare.yaml
     python projects/benchmark/compare.py config=my.yaml                      # another config
-    python projects/benchmark/compare.py episodes=5 methods=[spiral,spiral_rl] conditions.shapes=[hexagon]
+    python projects/benchmark/compare.py episodes=5 methods=[spiral_rule,forge] conditions.shapes=[hexagon]
     python projects/benchmark/compare.py conditions.clearance_mm=[0.1,0.2] conditions.hole_error_mm=["0-4"]
     python projects/benchmark/compare.py view.enabled=true view.method=forge conditions.shapes=[cuboid] episodes=5
     python projects/benchmark/compare.py out=projects/benchmark/results/compare_<time>   # resume an interrupted run
@@ -54,9 +54,8 @@ import yaml
 HERE = Path(__file__).resolve().parent
 PROJECTS = HERE.parent
 BED = PROJECTS.parent                           # .../mujoco_rl_bed (relative paths in the config resolve here)
-NAMES = {"spiral": "Spiral", "spiral_rule": "Spiral+rule", "spiral_rl": "Spiral+RL", "forge": "FORGE",
-         "tacdiff": "TacDiff"}
-ORDER = {"tacdiff": 0, "forge": 1, "spiral_rl": 2, "spiral_rule": 3, "spiral": 4}   # slowest first (load balance)
+NAMES = {"spiral_rule": "Spiral+rule", "forge": "FORGE", "tacdiff": "TacDiff"}
+ORDER = {"tacdiff": 0, "forge": 1, "spiral_rule": 2}   # slowest first (load balance)
 SHAPES = ("cylinder", "cuboid", "hexagon", "octagon")
 
 
@@ -448,29 +447,15 @@ def _episodes(env, seeds: list[int], cfg: dict, step_fn, reset_fn=None) -> list[
     return rows
 
 
-def job_spiral(cond: dict, seeds: list[int], cfg: dict, method: str) -> list[dict]:
-    if method == "spiral_rl":                               # load before the env (viewer) exists, see _load_sb3
-        m = cfg["models"]
-        model, mean, std, clip = _load_sb3(path_of(m["spiral_rl_run"]), m["spiral_rl_checkpoint"])
+def job_spiral_rule(cond: dict, seeds: list[int], cfg: dict, method: str = "spiral_rule") -> list[dict]:
+    """Spiral search + scripted catch rule (|F_xy| > 3.5 N for 3 steps -> try insert for 0.6 s)."""
+    from compliant_RL.scripted import CatchRule
+
     env = make_spiral_env(cond, cfg)
     p = env.policy_obs_dim
+    rule = CatchRule()
     try:
-        if method == "spiral":
-            return _episodes(env, seeds, cfg, lambda o: np.array([-1.0]))
-        if method == "spiral_rule":
-            from compliant_RL.scripted import CatchRule
-
-            rule = CatchRule()
-            return _episodes(env, seeds, cfg, lambda o: np.array([rule(o[:p])]), lambda s: rule.reset())
-        mem = {}
-
-        def act(o):
-            x = np.clip((o - mean) / std, -clip, clip).astype(np.float32)
-            a, mem["state"] = model.predict(x[None], state=mem["state"], episode_start=mem["start"], deterministic=True)
-            mem["start"] = np.zeros((1,), dtype=bool)
-            return a[0]
-
-        return _episodes(env, seeds, cfg, act, lambda s: mem.update(state=None, start=np.ones((1,), dtype=bool)))
+        return _episodes(env, seeds, cfg, lambda o: np.array([rule(o[:p])]), lambda s: rule.reset())
     finally:
         _close(env, cfg)
 
@@ -530,8 +515,7 @@ def job_tacdiff(cond: dict, seeds: list[int], cfg: dict, method: str = "tacdiff"
     return rows
 
 
-JOBS = {"spiral": job_spiral, "spiral_rule": job_spiral, "spiral_rl": job_spiral, "forge": job_forge,
-        "tacdiff": job_tacdiff}
+JOBS = {"spiral_rule": job_spiral_rule, "forge": job_forge, "tacdiff": job_tacdiff}
 
 
 def _after_episode(env, rows: list[dict], cfg: dict) -> bool:

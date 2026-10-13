@@ -8,7 +8,6 @@ identical episodes.
 - **Commands** for setup, training, evaluation and comparison: [`mujoco_rl_bed/commands.md`](mujoco_rl_bed/commands.md)
 - **Benchmark results**: [`mujoco_rl_bed/projects/benchmark/benchmark_comparisons.md`](mujoco_rl_bed/projects/benchmark/benchmark_comparisons.md)
   (raw per-episode results of any run: `mujoco_rl_bed/projects/benchmark/results/<run>/`)
-- **Design notes for the spiral residual RL** (what was tried and why): [`mujoco_rl_bed/projects/compliant_RL/RL_NOTES.md`](mujoco_rl_bed/projects/compliant_RL/RL_NOTES.md)
 
 ## Quick start: reproduce the benchmark
 
@@ -39,7 +38,7 @@ python projects/benchmark/compare.py config=projects/benchmark/benchmark_compari
 ```
 
 It prints one line per method and a summary table (`results/smoke/summary.md`). Full comparison (48 conditions x
-20 episodes; Spiral+RL and FORGE take ~20 min with 4 workers, TacDiffusion several hours):
+20 episodes; Spiral+rule and FORGE take ~20 min with 4 workers, TacDiffusion several hours):
 
 ```bash
 python projects/benchmark/compare.py config=projects/benchmark/benchmark_comparison.yaml workers=4
@@ -48,8 +47,9 @@ python projects/benchmark/compare.py config=projects/benchmark/benchmark_compari
 - **Memory:** each worker needs ~1 GB of RAM; keep `workers` at or below (RAM in GB) / 1.5 and below the core count.
 - **MuJoCo is pinned to 3.10.0.** Newer versions (3.15) change the contact forces in these tasks 3-4x, and the
   numbers no longer match.
-- A run writes into `out` and resumes from there if interrupted; `methods=[spiral_rl,forge]` skips TacDiffusion.
-- Our results for this config: `projects/benchmark/results/benchmark_comparison/` (episodes, `summary.md`).
+- Each run writes a new `results/compare_<time>/`; pass `out=<that folder>` to resume an interrupted run.
+  `methods=[spiral_rule,forge]` skips TacDiffusion.
+- Our reported run (Spiral+RL, FORGE): `projects/benchmark/results/benchmark_comparison/` (episodes, `summary.md`).
 
 ## Policies
 
@@ -108,7 +108,7 @@ is an environment override (e.g. `task.events.randomize_friction.params.lo=0.3`)
 
 | Script | Purpose | Important arguments |
 |---|---|---|
-| `projects/benchmark/compare.py` | Compare spiral, spiral+rule, spiral RL, FORGE and TacDiffusion on identical seeds; writes `summary.md` / `.csv`. With `view.enabled=true` it shows one method in the viewer instead. | `config=<yaml>` (default `compare.yaml`), `methods=[...]`, `episodes`, `conditions.shapes` (cylinder, cuboid, hexagon, octagon), `conditions.clearance_mm`, `conditions.hole_error_mm`, `conditions.tilt_deg`, `conditions.friction` (`"a"` exact or `"a-b"` range), `models.*`, `view.method` |
+| `projects/benchmark/compare.py` | Compare the spiral catch rule (`spiral_rule`), FORGE and TacDiffusion on identical seeds; writes `summary.md` / `.csv`. With `view.enabled=true` it shows one method in the viewer instead. | `config=<yaml>` (default `compare.yaml`), `methods=[...]`, `episodes`, `conditions.shapes` (cylinder, cuboid, hexagon, octagon), `conditions.clearance_mm`, `conditions.hole_error_mm`, `conditions.tilt_deg`, `conditions.friction` (`"a"` exact or `"a-b"` range), `models.*`, `view.method` |
 | `projects/forge/train.py` | Train FORGE | `algo` (`ppo`/`recurrent_ppo`), `asymmetric`, `n_envs`, `n_steps`, `batch_size`, `total_timesteps`, `learning_rate`, `lstm_hidden_size`, `net_arch`, `init_from`, `run_name` |
 | `projects/forge/eval.py`, `view.py` | Evaluate / watch a FORGE run | `run`, `checkpoint`, `episodes`, `render`, `mode` (`scripted`/`idle`/`random`, view only) |
 | `projects/compliant_RL/bc_warmstart.py` | Spiral RL step 1: imitate the catch rule into the LSTM policy | `task` (default `compliant_peg_s2g`), `episodes_per_env`, `epochs`, `run_name` |

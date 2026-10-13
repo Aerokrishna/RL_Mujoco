@@ -8,3 +8,5 @@ MUJOCO_LOG.TXT
 system_check_*.json
 # benchmark outputs
 projects/benchmark/results/
+# local design notes (not shared)
+projects/compliant_RL/RL_NOTES.md

@@ -1,11 +1,11 @@
 # Config of the comparison reported in `benchmark_comparisons.md` (see compare.yaml for what every key means).
 # Run:  python projects/benchmark/compare.py config=projects/benchmark/benchmark_comparison.yaml
-methods: [spiral_rl, forge, tacdiff]
+methods: [spiral_rule, forge, tacdiff]
 
 episodes: 20
 seed: 2000
 time_max: 20.0
-workers: 11
+workers: 4              # ~1 GB RAM each; keep <= RAM in GB / 1.5 and < CPU cores
 
 conditions:
   shapes: [cylinder, cuboid, octagon]
@@ -20,8 +20,6 @@ paper_error: {enabled: false, tol_mm: 2.0, tol_deg: 2.0}
 
 models:
   forge_run: projects/forge/runs/jitter_but_works
-  spiral_rl_run: projects/compliant_RL/runs/compliant_peg_s2g_20261012-122716_s0_s2g_bc
-  spiral_rl_checkpoint: final_model.zip
   tacdiff_model: ../diffusion/TacDiffusion/output/TacDiffusion_model_256.onnx   # authors' 256 model (512: 45 ms/call here, 256: 14 ms)
 
 spiral:
@@ -37,8 +35,8 @@ forge:
 
 view:
   enabled: false
-  method: spiral_rl
+  method: spiral_rule
   realtime: true
   pause_s: 1.0
 
-out: projects/benchmark/results/benchmark_comparison
+out: ""                 # "" = new results/compare_<time>/ (results/benchmark_comparison/ holds the reported run)

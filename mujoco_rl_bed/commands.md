@@ -6,7 +6,6 @@ against the scripted spiral and TacDiffusion:
 - **FORGE** (`projects/forge`): end-to-end force-conditioned RL policy (position actions, LSTM, asymmetric critic).
 - **Spiral residual RL** (`projects/compliant_RL`): a scripted spiral search on the axis compliance controller plus a
   learned "try insert" decision (pause the spiral, soft gains, 5 N push when the peg is caught on the hole edge).
-  Background and results: `projects/compliant_RL/RL_NOTES.md`.
 
 ## 0. Setup
 
@@ -52,16 +51,15 @@ overridden on the command line with dotted keys and YAML values:
 ```bash
 python projects/benchmark/compare.py                                        # everything in compare.yaml
 python projects/benchmark/compare.py config=my_config.yaml                  # a copy with your settings
-python projects/benchmark/compare.py episodes=60 methods=[spiral,spiral_rl] \
+python projects/benchmark/compare.py episodes=60 methods=[spiral_rule,forge] \
     conditions.shapes=[cylinder,cuboid,hexagon,octagon] conditions.clearance_mm=[0.1,0.2] \
     conditions.hole_error_mm=["0-4"] conditions.tilt_deg=["0-8"] conditions.friction=["0.5-1.0"]
-python projects/benchmark/compare.py methods=[spiral_rl] models.spiral_rl_run=projects/compliant_RL/runs/<run> \
-    models.spiral_rl_checkpoint=checkpoints/model_1000000_steps.zip        # evaluate a new spiral checkpoint
 python projects/benchmark/compare.py methods=[forge] models.forge_run=projects/forge/runs/<run>
 python projects/benchmark/compare.py out=projects/benchmark/results/compare_<time>   # resume an interrupted run
 ```
 
-- Methods: `spiral` (plain), `spiral_rule` (scripted catch rule), `spiral_rl` (learned catch policy), `forge`, `tacdiff`.
+- Methods: `spiral_rule` (spiral search + scripted catch rule), `forge`, `tacdiff`. A learned spiral catch policy is
+  evaluated with `projects/compliant_RL/eval.py` (section 3).
 - Shapes: `cylinder`, `cuboid`, `hexagon`, `octagon` (8 mm across). Levels: `"a"` exact, `"a-b"` uniform.
 - Success = peg tip within 1 mm of the floor and 2.5 mm of the axis at any time (the episode stops there).
 - Output: `projects/benchmark/results/compare_<time>/summary.md` (success with 95 % CI, time, F_max, failures split
@@ -73,7 +71,7 @@ python projects/benchmark/compare.py out=projects/benchmark/results/compare_<tim
 **Watch a method in the viewer** (one condition after another, nothing saved):
 
 ```bash
-python projects/benchmark/compare.py view.enabled=true view.method=spiral_rl episodes=10 \
+python projects/benchmark/compare.py view.enabled=true view.method=spiral_rule episodes=10 \
     conditions.shapes=[hexagon] conditions.clearance_mm=[0.2]
 python projects/benchmark/compare.py view.enabled=true view.method=forge view.realtime=false
 ```
@@ -169,9 +167,10 @@ screen -dmS spiral bash -c "python projects/compliant_RL/train.py task=compliant
 ```
 
 - The network keys (`algo`, `asymmetric`, `net_arch`, `lstm_hidden_size`) must match the warm start.
-- Judge it on fixed seeds (section 1), not on the training success rate, which includes exploration noise.
+- Judge it on fixed seeds (`projects/compliant_RL/eval.py`), not on the training success rate, which includes
+  exploration noise.
 - Watch `episode/try_onsets` and `episode/try_true_frac`: tries rising while the true fraction stays ~15 % means PPO
-  is drifting toward blanket tries. That happened in runs H and I (see `RL_NOTES.md`): the warm start stayed best at
+  is drifting toward blanket tries. That happened in runs H and I: the warm start stayed best at
   0.25 mm. Stop when the fixed-seed evaluation falls below the warm start.
 
 **Spiral-task variations** (append to step 1 and step 2 alike so both see the same task):

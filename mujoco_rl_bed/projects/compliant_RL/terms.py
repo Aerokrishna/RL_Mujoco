@@ -186,27 +186,7 @@ class SpiralResidual(ActionTerm):
                   speed v, out to r_max and back; drop when the TCP has moved drop_th further along R_f z
                   than at touchdown
         insert    task gains (the controller config: soft lateral, soft tilt), push f_insert, anchor held at
-                  the TCP position at the drop
-
-    Residual: anchor += R_f [s[0:2] * res_max, 0] (all phases); spiral speed scale 1 + s[2] for s[2] <= 0 and
-    1 + s[2] (speed_max - 1) above, so [0, speed_max] with 1 at zero residual (0 = hold the spiral). With
-    speed_action=False the action is the lateral residual only (a in [-1, 1]^2) and the spiral runs at v. With
-    speed_affine=True the speed scale is speed_lo + (speed_hi - speed_lo)(1 + s[2]) / 2 instead (e.g. [0, 1]: zero
-    residual runs at v/2, -1 pauses, +1 runs at v). With try_action=True, s[2] is instead a "try insert" level
-    tau = clip((s[2] - try_dead) / (1 - try_dead), 0, 1), used in the search phase only: spiral speed 1 - tau, push
-    f_search + tau (f_try - f_search), gains interpolated log-linearly from the search gains (tau = 0) to the task
-    gains (tau = 1), so tau = 1 pauses the spiral and lets the compliance centre and straighten a peg caught on the
-    hole edge; the drop detector still switches to the insert phase. The try dimension is not EMA-smoothed. Writes `ctx.state["spiral"]["tau"]` and
-    ["try_t"] (time since tau became > 0 [s]); try metrics: steps with tau > 0, onsets, and the fraction of try
-    steps with the tip within 0.5 mm of the axis (logging only). With try_action=True and lateral_action=False the
-    action is the try level only (a in [-1, 1]^1, no lateral residual). With try_macro = n > 0 as well, the action is
-    binary (Discrete(2)): 1 starts a full try (tau = 1) for n policy steps, during which the action is ignored, then
-    the spiral resumes; 0 keeps searching. The applied action (last_action) is then the try flag.
-    Episode metrics (logging only): mean |residual| x, y [mm] and the mean residual component toward the true
-    hole [mm] (positive = steering toward it), in the search and insert phases. Writes `ctx.state["spiral"]` (phase 0/1/2, base offset (2) [m], depth since
-    touchdown [m]) for the observations. `cfg.params`: f_search (1 N), f_insert (5 N), v (10 mm/s),
-    pitch (0.8 mm), r_max (2.6 mm), drop_th (0.5 mm), res_max (1 mm), speed_action (True), speed_max (2), ks_lat (2000),
-    ds_lat (190), ks_tilt (3), ds_tilt (1.5).
+                  the TCP position
     """
 
     def __init__(self, cfg: ActionCfg, ctx: "Context") -> None:
