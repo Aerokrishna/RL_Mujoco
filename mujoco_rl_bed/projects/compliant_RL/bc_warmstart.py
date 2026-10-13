@@ -38,7 +38,14 @@ DEFAULTS = {"task": "compliant_peg_s2g", "run_name": "s2g_bc", "n_envs": 10, "ep
 
 def collect(task: str, n: int, n_ep: int, seed: int, gamma: float, no_try: float, pd: int, phase_idx: int,
             discrete: bool):
-    """Roll out the catch rule; return whole episodes (normalized obs, rule action, normalized return) + the venv."""
+    """Roll out the catch rule; return whole episodes (normalized obs, rule action, normalized return) + the venv.
+
+    Episodes that end early (the `unstable` termination: the simulation blew up) are dropped, and the observation and
+    return normalization statistics are fitted on the remaining episodes only: the steps before a blow-up carry huge
+    forces and velocities that would otherwise dominate the running variance and squash the catch signal (server run:
+    3 of 320 episodes, held-out push precision 0.3 vs 0.95 without them).
+    """
+    from stable_baselines3.common.running_mean_std import RunningMeanStd
     from stable_baselines3.common.vec_env import VecNormalize
 
     from compliant_RL.scripted import CatchRule
@@ -63,18 +70,36 @@ def collect(task: str, n: int, n_ep: int, seed: int, gamma: float, no_try: float
             succ.append(bool(infos[i].get("is_success", False)))
     O, A, R, D = map(np.array, (O, A, R, D))                      # (steps, n, ...)
     print(f"collected {len(succ)} episodes: rule success {np.mean(succ):.3f}, try steps {(A > 0).mean():.4f}", flush=True)
-    on = venv.normalize_obs(O.reshape(-1, O.shape[-1])).reshape(O.shape).astype(np.float32)
-    rn = venv.normalize_reward(R.reshape(-1)).reshape(R.shape)
-    eps = []
+    raw_eps = []                                                  # (obs, action, reward) per whole episode
     for i in range(n):
         s = 0
         for e in np.flatnonzero(D[:, i]):
-            g, acc = np.zeros(e + 1 - s), 0.0
-            for t in range(e - s, -1, -1):
-                acc = rn[s + t, i] + gamma * acc
-                g[t] = acc
-            eps.append((on[s:e + 1, i], A[s:e + 1, i], g))
+            raw_eps.append((O[s:e + 1, i], A[s:e + 1, i], R[s:e + 1, i]))
             s = e + 1
+    full = max(len(e[0]) for e in raw_eps)
+    kept = [e for e in raw_eps if len(e[0]) == full and np.isfinite(e[0]).all() and np.isfinite(e[2]).all()]
+    print(f"[bc] dropped {len(raw_eps) - len(kept)} of {len(raw_eps)} episodes that ended early or are non-finite",
+          flush=True)
+    venv.obs_rms = RunningMeanStd(shape=O.shape[-1:])
+    venv.obs_rms.update(np.concatenate([e[0] for e in kept]).astype(np.float64))
+    venv.ret_rms = RunningMeanStd(shape=())
+    for e in kept:                                                # discounted running return, as VecNormalize does
+        ret, rets = 0.0, []
+        for r in e[2]:
+            ret = ret * gamma + float(r)
+            rets.append(ret)
+        venv.ret_rms.update(np.array(rets))
+    print(f"[bc] obs scale (std): contact force xy {np.sqrt(venv.obs_rms.var[:2]).round(2)} N, "
+          f"return std {np.sqrt(venv.ret_rms.var):.1f}", flush=True)
+    eps = []
+    for o, a, r in kept:
+        on = venv.normalize_obs(o).astype(np.float32)
+        rn = venv.normalize_reward(r)
+        g, acc = np.zeros(len(rn)), 0.0
+        for t in range(len(rn) - 1, -1, -1):
+            acc = rn[t] + gamma * acc
+            g[t] = acc
+        eps.append((on, a, g))
     return eps, venv
 
 
