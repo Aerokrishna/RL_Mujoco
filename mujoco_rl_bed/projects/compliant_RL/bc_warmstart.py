@@ -19,7 +19,10 @@ Usage (`conda activate dqn`, from `mujoco_rl_bed/`):
 Keys (defaults in brackets): task [compliant_peg_s2g], run_name [s2g_bc], n_envs [10], episodes_per_env [30],
 epochs [40], seed [5000], gamma [0.995], net_arch [[64,64]], lstm_hidden_size [128], log_std_init [-1.5],
 no_try [-0.3; 0 for a binary action], w_pos [5; 50 for a binary action: push onsets are ~0.3 % of the steps (a push
-mostly ends within 1-2 steps when the peg drops), and at 5x the classifier learnt never to push (recall 0)].
+mostly ends within 1-2 steps when the peg drops), and at 5x the classifier learnt never to push (recall 0)],
+explore_push [0.002: binary action only; mean push probability on the rule's no-push steps after BC, set by a
+temperature on the push logits that keeps every decision; a saturated BC policy (p ~ 1e-4) gave PPO entropy ~0.001 and
+KL 0, i.e. no exploration and no learning].
 The network keys must match the later PPO run (`train.py` checks them for `init_from`).
 """
 
@@ -33,7 +36,7 @@ import numpy as np
 HERE = Path(__file__).resolve().parent
 DEFAULTS = {"task": "compliant_peg_s2g", "run_name": "s2g_bc", "n_envs": 10, "episodes_per_env": 30, "epochs": 40,
             "seed": 5000, "gamma": 0.995, "net_arch": "[64,64]", "lstm_hidden_size": 128, "log_std_init": -1.5,
-            "no_try": -0.3, "w_pos": "auto"}
+            "no_try": -0.3, "w_pos": "auto", "explore_push": 0.002}
 
 
 def collect(task: str, n: int, n_ep: int, seed: int, gamma: float, no_try: float, pd: int, phase_idx: int,
@@ -103,7 +106,7 @@ def collect(task: str, n: int, n_ep: int, seed: int, gamma: float, no_try: float
     return eps, venv
 
 
-def train_bc(pol, eps: list, epochs: int, w_pos: float, discrete: bool) -> float:
+def train_bc(pol, eps: list, epochs: int, w_pos: float, discrete: bool, explore_push: float = 0.002) -> float:
     """Fit the actor to the rule actions (Gaussian mean, or push/no-push logits when `discrete`) and the critic to the
     returns. Episodes are zero-padded to the longest one and the padding is masked out of the losses (an episode
     that ends early, e.g. on the `unstable` termination, must not truncate the others)."""
@@ -169,16 +172,21 @@ def train_bc(pol, eps: list, epochs: int, w_pos: float, discrete: bool) -> float
                 print(f"epoch {ep + 1}: held-out try recall {recall:.2f}, precision "
                       f"{tp / max(float(pred.sum()), 1):.2f}, value R2 {r2:.2f}", flush=True)
     if discrete:
-        recall = calibrate_push(pol, forward, Xo, Xa, Xm, tr, va)
+        recall = calibrate_push(pol, forward, Xo, Xa, Xm, tr, va, explore_push)
     return recall
 
 
-def calibrate_push(pol, forward, Xo, Xa, Xm, tr, va) -> float:
-    """Shift the push logit so that push decisions best match the rule on the training episodes (max F1).
+def calibrate_push(pol, forward, Xo, Xa, Xm, tr, va, explore_push: float) -> float:
+    """Shift the push logit so that push decisions best match the rule on the training episodes (max F1), then soften
+    the push probabilities for PPO exploration.
 
     The `w_pos` weighting makes the classifier find the rare push steps but inflates every borderline push
     probability (held-out precision ~0.2 at recall ~0.97 on the server data); the shift keeps the ranking and moves the
     decision threshold. Prints held-out recall / precision after the shift.
+
+    Exploration: both logits are divided by a temperature T >= 1 chosen so that the mean push probability on the rule's
+    no-push training steps is `explore_push`. Dividing by T keeps the sign of every logit difference, so the
+    deterministic (argmax) policy is unchanged; only the sampled policy that PPO trains with gets softer.
 
     Returns:
         Held-out recall after the shift.
@@ -205,6 +213,23 @@ def calibrate_push(pol, forward, Xo, Xa, Xm, tr, va) -> float:
     recall, precision = pr(dv, yv, 0.0)
     print(f"[bc] push threshold calibrated (logit shift {shift:.2f}): held-out try recall {recall:.2f}, "
           f"precision {precision:.2f}", flush=True)
+
+    dn, dp = d[~y] - shift, d[y] - shift
+
+    def p_neg(T):
+        return float((1.0 / (1.0 + np.exp(-dn / T))).mean())
+
+    lo, hi = 1.0, 1000.0
+    if p_neg(lo) < explore_push:
+        for _ in range(60):                               # p_neg grows with T (no-push margins are mostly negative)
+            mid = np.sqrt(lo * hi)
+            lo, hi = (mid, hi) if p_neg(mid) < explore_push else (lo, mid)
+    T = lo
+    pol.action_net.weight.data /= T
+    pol.action_net.bias.data /= T
+    p_pos = float((1.0 / (1.0 + np.exp(-dp / T))).mean())
+    print(f"[bc] exploration temperature {T:.2f}: mean push probability {p_neg(T):.4f} on no-push steps, "
+          f"{p_pos:.2f} on push steps (sampled policy)", flush=True)
     return recall
 
 
@@ -238,7 +263,7 @@ def main(argv: list[str]) -> None:
     eps, venv = collect(a["task"], int(a["n_envs"]), int(a["episodes_per_env"]), int(a["seed"]), float(a["gamma"]),
                         0.0 if discrete else float(a["no_try"]), model.policy.actor_dim, phase_idx, discrete)
     w_pos = (50.0 if discrete else 5.0) if a["w_pos"] == "auto" else float(a["w_pos"])
-    recall = train_bc(model.policy, eps, int(a["epochs"]), w_pos, discrete)
+    recall = train_bc(model.policy, eps, int(a["epochs"]), w_pos, discrete, float(a["explore_push"]))
     if recall < 0.7:
         print(f"[bc] WARNING: held-out try recall {recall:.2f} < 0.7: the warm start does not imitate the rule; "
               f"raise w_pos (now {w_pos:g}) or epochs before fine-tuning", flush=True)
