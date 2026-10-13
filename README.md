@@ -27,6 +27,8 @@ python -m pytest -q                      # optional; one known failure: test_scr
 ```
 
 Already cloned without `--recursive`? Run `git submodule update --init` in `RL_Mujoco/`.
+Packages installed with `pip install --user` (in `~/.local`) load into every env and can shadow the pinned ones; keep
+them out of `mjtest` with `conda env config vars set PYTHONNOUSERSITE=1 -n mjtest` (then re-activate the env).
 
 Smoke test (~3 min, 2 episodes per method on one condition):
 
