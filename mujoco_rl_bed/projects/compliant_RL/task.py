@@ -295,3 +295,142 @@ def compliant_peg_s2d() -> TaskCfg:
                    (0.0, 0.004, 8.0, 0.0046)),
         "advance_at": (0.95, 0.80, 0.65), "window": 50})
     return cfg
+
+
+@register_task("compliant_peg_s2e")
+def compliant_peg_s2e() -> TaskCfg:
+    """Stage 2e: dwell-capable search. Lateral residual + spiral slow-down/pause on the full error range.
+
+    - Start: offset U(0, 4 mm), tilt U(0, 8°) (as `compliant_peg_s2b`), 20 s episodes, spiral r_max 4.6 mm.
+    - Action (3): lateral residual on the anchor (±1.5 mm, enough for a 1 mm local search) and the spiral speed
+      (1 + a) / 2 x 10 mm/s: zero residual runs a slower 5 mm/s spiral, -1 pauses it, +1 runs it at 10 mm/s.
+    - Actor observation (27): contact wrench with history 3 (the proximity cue: held-out ROC AUC ~0.70 for
+      "tip 0.25-1 mm from the axis" vs farther), spiral offset, depth, spring deflection, phase, previous action.
+    - Reward as `compliant_peg_s2` with the close-to-hole kernel doubled (0.5 -> 1.0 K(1000, 0)(tip xy distance)),
+      so dwelling where the wrench suggests the hole pays. Episode metrics add the mean speed scale with the tip
+      within 1 mm of the axis vs farther (logging only).
+
+    Returns:
+        A new `TaskCfg`.
+    """
+    cfg = compliant_peg_s2b()
+    cfg.action.params.update({"speed_affine": True, "speed_lo": 0.0, "speed_hi": 1.0, "v": 0.01, "res_max": 0.0015})
+    cfg.obs.term_cfg["cr_wrench_tcp"] = ObsTermCfg(noise_std=(1.0, 1.0, 1.0, 0.05, 0.05, 0.05), history=3)
+    cfg.rewards["kp_xy"] = RewardTermCfg(weight=1.0, func="cr_kp_xy", params={"a": 1000.0, "b": 0.0})
+    return cfg
+
+
+S2F_POLICY_TERMS = ["cr_wrench_tcp", "cr_spring_defl", "sp_tcp_lat_vel", "sp_tcp_tilt", "sp_base_offset", "sp_depth",
+                    "sp_phase", "sp_try_state", "last_action"]
+S2F_CRITIC_TERMS = ["peg_tip_rel_hole_gt", "cr_peg_axis_gt", "success_gt", "part_params_gt", "contact_force",
+                    "episode_progress"] + S2F_POLICY_TERMS
+
+
+@register_task("compliant_peg_s2f")
+def compliant_peg_s2f() -> TaskCfg:
+    """Stage 2f: catch-and-insert. The spiral (1.5 N) plus a lateral residual and a "try insert" action.
+
+    Near misses where the hole edge catches the peg (tip 0-0.35 mm from the axis) give a 3-5 N lateral force and a
+    2-2.7 mm spring deflection toward the hole that survive the sensor noise; a lateral nudge does not drop a tilted
+    peg hung on the rim, but pausing with soft gains and a 5 N push does. Scripted reference through this action
+    (|F_lat| > 3.5 N for 3 steps -> try for 0.6 s, anchor onto the virtual frame): 50/60 vs 49/60 zero residual
+    (seeds 2000-2059).
+
+    - Start as `compliant_peg_s2b`: offset U(0, 4 mm), tilt U(0, 8°), 20 s episodes, spiral r_max 4.6 mm, f_search 1.5 N.
+    - Action (3): lateral residual on the anchor (±1 mm) and try level tau (dead zone below a = 0.3): spiral speed
+      1 - tau, push 1.5 + 3.5 tau N, search -> task gains (log-interpolated). Zero = the scripted spiral.
+    - Actor observation (20): contact wrench (6, noise 1 N / 0.05 Nm), spring deflection (2), TCP lateral velocity
+      (2, noise 1 mm/s) and roll/pitch from the start (2, noise 1 mrad), spiral offset (2), depth (1), phase (1),
+      try state (tau, time in try) (2), previous applied action (3). Meant for a recurrent (LSTM) policy.
+    - Critic: actor terms (clean) + true tip offset, peg axis, success label, part parameters, contact force,
+      episode progress.
+    - Reward: as `compliant_peg_s2` - 0.1 tau per step.
+
+    Returns:
+        A new `TaskCfg`.
+    """
+    cfg = compliant_peg_s2b()
+    cfg.action.params.update({"f_search": 1.5, "res_max": 0.001, "try_action": True, "f_try": 5.0, "try_dead": 0.3})
+    cfg.obs = ObsCfg(
+        groups={"policy": list(S2F_POLICY_TERMS), "critic": list(S2F_CRITIC_TERMS)},
+        term_cfg={"cr_wrench_tcp": ObsTermCfg(noise_std=(1.0, 1.0, 1.0, 0.05, 0.05, 0.05)),
+                  "sp_tcp_lat_vel": ObsTermCfg(noise_std=0.001),
+                  "sp_tcp_tilt": ObsTermCfg(noise_std=0.001)},
+    )
+    cfg.rewards["try_cost"] = RewardTermCfg(weight=-0.1, func="sp_try_cost")
+    return cfg
+
+
+@register_task("compliant_peg_s2g")
+def compliant_peg_s2g() -> TaskCfg:
+    """Stage 2g: `compliant_peg_s2f` with the try level as the only action and a 5x higher try cost.
+
+    Run G (s2f, LSTM, from scratch) learnt to try often and long (2 tries, ~3.6 s paused per episode, 5-8 % of the
+    try steps at the hole) and fell to 35/60 at 1M steps (zero residual 49/60): blanket trying paid off in
+    small-offset episodes. Here the lateral residual is removed (it added nothing to the scripted rule) and a full
+    try costs 0.5 per step, so a 0.6 s false try costs ~7.5, about one step of success reward x 2.5 s.
+
+    - Action (1): try level tau (dead zone below a = 0.3), as `compliant_peg_s2f`; zero = the scripted spiral.
+    - Actor observation (19): as `compliant_peg_s2f` (previous applied action is 1-D). Critic as `compliant_peg_s2f`.
+    - Reward: as `compliant_peg_s2` - 0.5 tau per step.
+
+    Returns:
+        A new `TaskCfg`.
+    """
+    cfg = compliant_peg_s2f()
+    cfg.action.params["lateral_action"] = False
+    cfg.rewards["try_cost"].weight = -0.5
+    return cfg
+
+
+@register_task("compliant_peg_s2h")
+def compliant_peg_s2h() -> TaskCfg:
+    """Stage 2h: `compliant_peg_s2g` at 0.1 mm clearance (hole radius 4.1 mm) with an action cost on the try output.
+
+    At 0.1 mm the spiral (pitch 0.8 mm, ~1 mm tracking lag) mostly passes the hole without dropping in: plain spiral
+    11/60, scripted rule 14/60, BC warm start 16/60, run H (s2g, many small tries) 24/60 at 4.6 mm reach (seeds
+    2000-2059, error 0-5 mm). Training here should teach where slowing/trying pays instead of everywhere.
+
+    - Start: hole-estimate error U(0, 5 mm), tilt U(0, 8°); spiral r_max 5.6 mm (all starts reachable); 20 s episodes.
+    - Action, observations, critic as `compliant_peg_s2g`.
+    - Reward: as `compliant_peg_s2g` - 0.05 (a + 1)^2 / 4 per step on the raw try action (no flat region below the
+      dead zone, so a policy that does not try drifts to -1).
+
+    Returns:
+        A new `TaskCfg`.
+    """
+    cfg = compliant_peg_s2g()
+    cfg.scene.assets = [Peg(name="peg"), RoundHole(name="hole", inner_radius=0.0041)]
+    cfg.action.params["r_max"] = 0.0056
+    cfg.events["shift_ee"].params.update({"offset_min": 0.0, "offset_max": 0.005})
+    cfg.rewards["try_action_cost"] = RewardTermCfg(weight=-0.05, func="sp_try_action_cost")
+    return cfg
+
+
+S2I_POLICY_TERMS = ["cr_wrench_tcp", "cr_spring_defl", "sp_tcp_lat_vel", "sp_tcp_tilt", "sp_depth", "sp_phase",
+                    "sp_try_state", "last_action"]
+S2I_CRITIC_TERMS = ["peg_tip_rel_hole_gt", "cr_peg_axis_gt", "success_gt", "part_params_gt", "contact_force",
+                    "episode_progress", "sp_base_offset"] + S2I_POLICY_TERMS
+
+
+@register_task("compliant_peg_s2i")
+def compliant_peg_s2i() -> TaskCfg:
+    """Stage 2i: `compliant_peg_s2g` with a binary push decision and no spiral-offset input.
+
+    Offline classifiers on plain-spiral rollouts (tip within 0.35 mm of the axis = catch, 600 episodes, held-out
+    episodes) found the catch detectable well beyond the scripted rule (catch events found: rule 28 %, all actor
+    inputs 75 %); depth and lateral velocity carry most of it, the spiral offset nothing (a position prior only).
+
+    - Action: Discrete(2), 0 = keep searching, 1 = full try (pause, task gains, 5 N) for 15 steps (0.6 s), during which
+      the action is ignored (`try_macro`).
+    - Actor observation (17): contact wrench (6, noise 1 N / 0.05 Nm), spring deflection (2), TCP lateral velocity (2),
+      roll/pitch (2), depth (1), phase (1), try state (2), try flag of the previous step (1).
+    - Critic: privileged terms + spiral offset + the actor terms (clean). Reward as `compliant_peg_s2g`.
+
+    Returns:
+        A new `TaskCfg`.
+    """
+    cfg = compliant_peg_s2g()
+    cfg.action.params["try_macro"] = 15
+    cfg.obs.groups = {"policy": list(S2I_POLICY_TERMS), "critic": list(S2I_CRITIC_TERMS)}
+    return cfg

@@ -1,4 +1,10 @@
-"""Privileged scripted corrector for `compliant_peg` (validates the residual action space; not deployable).
+"""Scripted policies for the `compliant_peg` tasks.
+
+`CatchRule`: the deployable catch rule for the spiral tasks with a try-insert action (`compliant_peg_s2f/g/h`). It
+reads only the actor observation and is the teacher of the warm start (`bc_warmstart.py`).
+
+`ScriptedCorrector`: privileged scripted corrector for `compliant_peg` (validates the residual action space; not
+deployable).
 
 It reads the true peg tip and grasp tilt and outputs the same 5D residual as the policy:
 
@@ -19,6 +25,49 @@ import numpy as np
 
 if TYPE_CHECKING:
     from mujoco_rl_bed.env.torque_env import TorqueEnv
+
+
+class CatchRule:
+    """Try insert when the peg is caught on the hole edge: |F_xy| > `f_th` for `k` search steps -> try for `hold` steps.
+
+    Works on the `compliant_peg_s2g` / `s2i` actor observation (wrench in [0:6], spiral phase / 2 in [`phase_idx`]:
+    15 for s2g, 13 for s2i); returns the try action (`no_try` when not trying, 1 while trying; 0 / 1 for s2i). A `cool`-step cooldown follows every try. Near misses
+    where the hole edge catches the peg give a 3-5 N lateral force toward the hole; friction spikes rarely last
+    3 steps above 3.5 N (92-93 % of the tries are real catches).
+    """
+
+    def __init__(self, f_th: float = 3.5, k: int = 3, hold: int = 15, cool: int = 10, no_try: float = -1.0,
+                 phase_idx: int = 15) -> None:
+        """Args:
+            f_th: Lateral force threshold [N].
+            k: Consecutive search steps above the threshold.
+            hold: Try length [policy steps] (15 = 0.6 s).
+            cool: Cooldown after a try [policy steps].
+            no_try: Action when not trying (any value below the try dead zone, 0.3).
+            phase_idx: Index of the spiral phase / 2 in the observation.
+        """
+        self.f_th, self.k, self.hold, self.cool, self.no_try = f_th, k, hold, cool, no_try
+        self.phase_idx = phase_idx
+        self.reset()
+
+    def reset(self) -> None:
+        """Clear the counters (call at every episode start)."""
+        self.cnt = self.left = self.cd = 0
+
+    def __call__(self, o: np.ndarray) -> float:
+        """Try action for actor observation `o`."""
+        if o[self.phase_idx] != 0.5:                       # not in the search phase
+            return self.no_try
+        self.cnt = self.cnt + 1 if math.hypot(o[0], o[1]) > self.f_th else 0
+        if self.left > 0:
+            self.left -= 1
+            if self.left == 0:
+                self.cd = self.cool
+        elif self.cd > 0:
+            self.cd -= 1
+        elif self.cnt >= self.k:
+            self.left = self.hold
+        return 1.0 if self.left > 0 else self.no_try
 
 
 class ScriptedCorrector:

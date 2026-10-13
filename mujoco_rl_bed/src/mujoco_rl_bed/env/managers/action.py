@@ -376,7 +376,11 @@ class ActionManager:
         self.ctx = ctx
         self.term = ACTION_TERMS[cfg.term](cfg, ctx)
         self.dim = self.term.dim
-        self.space = gym.spaces.Box(-1.0, 1.0, shape=(self.dim,), dtype=np.float32)
+        # A term with `n_discrete` = n > 0 takes one choice in {0, ..., n - 1} (passed on as a 1-D float action).
+        n = int(getattr(self.term, "n_discrete", 0))
+        if n and self.dim != 1:
+            raise ValueError(f"a discrete action term must have dim 1, got {self.dim}")
+        self.space = gym.spaces.Discrete(n) if n else gym.spaces.Box(-1.0, 1.0, shape=(self.dim,), dtype=np.float32)
         ctx.action = np.zeros(self.dim)
         ctx.prev_action = np.zeros(self.dim)
         ctx.applied_action = np.zeros(self.dim)
@@ -391,7 +395,10 @@ class ActionManager:
         """
         ctx = self.ctx
         np.copyto(ctx.prev_action, ctx.action)
-        np.clip(action, -1.0, 1.0, out=ctx.action)
+        if isinstance(self.space, gym.spaces.Discrete):
+            ctx.action[0] = float(np.asarray(action).reshape(-1)[0])
+        else:
+            np.clip(action, -1.0, 1.0, out=ctx.action)
         np.nan_to_num(ctx.action, copy=False, nan=0.0)
         if self._first:  # no action history yet: do not count the first action as a "change"
             np.copyto(ctx.prev_action, ctx.action)

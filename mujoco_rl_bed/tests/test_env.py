@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import sys
 
+import gymnasium as gym
 import numpy as np
 import pytest
 
@@ -21,8 +22,11 @@ def test_spaces_and_shapes(task: str) -> None:
     obs, info = env.reset(seed=0)
     assert env.observation_space.shape == (env.obs_mgr.dim("policy"),)
     assert obs.shape == env.observation_space.shape and obs.dtype == np.float32
-    assert env.action_space.dtype == np.float32
-    assert np.all(env.action_space.low == -1.0) and np.all(env.action_space.high == 1.0)
+    if isinstance(env.action_space, gym.spaces.Discrete):   # binary-decision tasks (e.g. compliant_peg_s2i)
+        assert env.action_mgr.dim == 1
+    else:
+        assert env.action_space.dtype == np.float32
+        assert np.all(env.action_space.low == -1.0) and np.all(env.action_space.high == 1.0)
     if env.obs_mgr.has_group("critic"):
         assert info["critic_obs"].shape == (env.obs_mgr.dim("critic"),)
     obs, reward, terminated, truncated, info = env.step(env.action_space.sample())

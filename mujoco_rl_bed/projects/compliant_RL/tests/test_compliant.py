@@ -54,20 +54,20 @@ def test_command_frame_fixed_under_tilt():
 
 
 def test_action_mapping():
-    """Push force covers [1, 15] N; all-zero action is the nominal 8 N push."""
+    """Side force ±10 N, push 10 ± 7 N clipped to 15 N, tilt ±10°; all-zero action is the nominal 10 N push."""
     env = make_env("compliant_peg", NO_DR)
     env.reset(seed=0)
     c = env.ctx.controller
     env.step(np.zeros(5))
-    assert c.f_push == 8.0 and np.all(c.f_lat == 0.0) and np.all(c.tilt == 0.0)
+    assert c.f_push == 10.0 and np.all(c.f_lat == 0.0) and np.all(c.tilt == 0.0)
     for _ in range(30):
         env.step(np.array([1.0, -1.0, 1.0, 1.0, -1.0]))
-    np.testing.assert_allclose(c.f_lat, [5.0, -5.0], atol=1e-6)
+    np.testing.assert_allclose(c.f_lat, [10.0, -10.0], atol=1e-6)
     np.testing.assert_allclose(np.degrees(c.tilt), [10.0, -10.0], atol=1e-4)
     assert abs(c.f_push - 15.0) < 1e-6
     for _ in range(30):
         env.step(np.array([0.0, 0.0, -1.0, 0.0, 0.0]))
-    assert abs(c.f_push - 1.0) < 1e-6
+    assert abs(c.f_push - 3.0) < 1e-6
 
 
 def test_base_controller_inserts_without_randomization():
@@ -82,3 +82,33 @@ def test_scripted_corrector_with_randomization():
     env = make_env("compliant_peg")
     pol = ScriptedCorrector(env)
     assert all(run(env, pol, seed=s)["ever_success"] for s in range(3))
+
+
+def test_s2f_zero_action_is_spiral():
+    """`compliant_peg_s2f` with zero action follows the `compliant_peg_s2b` spiral at 1.5 N."""
+    env = make_env("compliant_peg_s2f")
+    ref = make_env("compliant_peg_s2b", {"task.action.params.f_search": "1.5"})
+    env.reset(seed=3)
+    ref.reset(seed=3)
+    for _ in range(100):
+        env.step(np.zeros(3))
+        ref.step(np.zeros(3))
+    np.testing.assert_allclose(env.plant.q, ref.plant.q, atol=1e-6)
+
+
+def test_s2f_try_action():
+    """A full try in the search phase pauses the spiral, switches to the task gains and pushes f_try."""
+    env = make_env("compliant_peg_s2f")
+    env.reset(seed=3)
+    c, sp, term = env.ctx.controller, env.ctx.state["spiral"], env.ctx.state["spiral_term"]
+    while sp["phase"] != 1:
+        env.step(np.zeros(3))
+    off = sp["offset"].copy()
+    env.step(np.array([0.0, 0.0, 1.0]))
+    env.step(np.array([0.0, 0.0, 1.0]))
+    assert sp["tau"] == 1.0 and sp["try_t"] > 0.0
+    np.testing.assert_allclose(sp["offset"], off)
+    np.testing.assert_allclose((c.k_lin[0], c.d_lin[0], c.k_rot[0], c.d_rot[0]), term.task_gains, rtol=1e-9)
+    assert c.f_push == term.f_try
+    env.step(np.zeros(3))
+    assert sp["tau"] == 0.0 and c.k_lin[0] == term.search_gains[0]

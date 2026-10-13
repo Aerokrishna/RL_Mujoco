@@ -190,7 +190,18 @@ class SpiralResidual(ActionTerm):
 
     Residual: anchor += R_f [s[0:2] * res_max, 0] (all phases); spiral speed scale 1 + s[2] for s[2] <= 0 and
     1 + s[2] (speed_max - 1) above, so [0, speed_max] with 1 at zero residual (0 = hold the spiral). With
-    speed_action=False the action is the lateral residual only (a in [-1, 1]^2) and the spiral runs at v.
+    speed_action=False the action is the lateral residual only (a in [-1, 1]^2) and the spiral runs at v. With
+    speed_affine=True the speed scale is speed_lo + (speed_hi - speed_lo)(1 + s[2]) / 2 instead (e.g. [0, 1]: zero
+    residual runs at v/2, -1 pauses, +1 runs at v). With try_action=True, s[2] is instead a "try insert" level
+    tau = clip((s[2] - try_dead) / (1 - try_dead), 0, 1), used in the search phase only: spiral speed 1 - tau, push
+    f_search + tau (f_try - f_search), gains interpolated log-linearly from the search gains (tau = 0) to the task
+    gains (tau = 1), so tau = 1 pauses the spiral and lets the compliance centre and straighten a peg caught on the
+    hole edge; the drop detector still switches to the insert phase. The try dimension is not EMA-smoothed. Writes `ctx.state["spiral"]["tau"]` and
+    ["try_t"] (time since tau became > 0 [s]); try metrics: steps with tau > 0, onsets, and the fraction of try
+    steps with the tip within 0.5 mm of the axis (logging only). With try_action=True and lateral_action=False the
+    action is the try level only (a in [-1, 1]^1, no lateral residual). With try_macro = n > 0 as well, the action is
+    binary (Discrete(2)): 1 starts a full try (tau = 1) for n policy steps, during which the action is ignored, then
+    the spiral resumes; 0 keeps searching. The applied action (last_action) is then the try flag.
     Episode metrics (logging only): mean |residual| x, y [mm] and the mean residual component toward the true
     hole [mm] (positive = steering toward it), in the search and insert phases. Writes `ctx.state["spiral"]` (phase 0/1/2, base offset (2) [m], depth since
     touchdown [m]) for the observations. `cfg.params`: f_search (1 N), f_insert (5 N), v (10 mm/s),
@@ -207,8 +218,17 @@ class SpiralResidual(ActionTerm):
         """
         super().__init__(cfg, ctx)
         p = cfg.params
-        self.speed_action = bool(p.get("speed_action", True))
-        self.dim = 3 if self.speed_action else 2
+        self.try_action = bool(p.get("try_action", False))
+        self.speed_action = bool(p.get("speed_action", True)) and not self.try_action
+        self.lateral_action = bool(p.get("lateral_action", True)) or not self.try_action
+        self.dim = (3 if self.lateral_action else 1) if self.try_action else (3 if self.speed_action else 2)
+        self.try_macro = int(p.get("try_macro", 0))
+        if self.try_macro and (not self.try_action or self.lateral_action):
+            raise ValueError("try_macro needs try_action=True and lateral_action=False")
+        self.n_discrete = 2 if self.try_macro else 0
+        self._macro_left = 0
+        self.f_try = float(p.get("f_try", 5.0))
+        self.try_dead = float(p.get("try_dead", 0.3))
         self.f_search = float(p.get("f_search", 1.0))
         self.f_insert = float(p.get("f_insert", 5.0))
         self.v = float(p.get("v", 0.01))
@@ -217,18 +237,25 @@ class SpiralResidual(ActionTerm):
         self.drop_th = float(p.get("drop_th", 0.0005))
         self.res_max = float(p.get("res_max", 0.001))
         self.speed_up = float(p.get("speed_max", 2.0)) - 1.0
+        self.speed_affine = bool(p.get("speed_affine", False))
+        self.speed_lo, self.speed_hi = float(p.get("speed_lo", 0.0)), float(p.get("speed_hi", 1.0))
         self.search_gains = (float(p.get("ks_lat", 2000.0)), float(p.get("ds_lat", 190.0)),
                              float(p.get("ks_tilt", 3.0)), float(p.get("ds_tilt", 1.5)))
         c = ctx.controller
         self.task_gains = (c.k_lin[0], c.d_lin[0], c.k_rot[0], c.d_rot[0])
+        self._lg_s, self._lg_t = np.log(self.search_gains), np.log(self.task_gains)
+        self._try = np.zeros(4)              # try steps, onsets, try steps / onsets with the tip within 0.5 mm
         self._ema = ctx.buffer("action_ema", 1)
         self._ema[0] = float(cfg.ema_factor)
         ctx.buffer("action_max_step", 3)  # read by ForgeState (λ is not used by this controller)
-        self.state = ctx.state["spiral"] = {"phase": 0, "offset": np.zeros(2), "depth": 0.0}
+        self.state = ctx.state["spiral"] = {"phase": 0, "offset": np.zeros(2), "depth": 0.0, "tau": 0.0, "try_t": 0.0}
         ctx.state["spiral_term"] = self
-        self._s = np.zeros(self.dim)
-        self._tmp = np.zeros(self.dim)
+        n = 3 if self.dim == 1 else self.dim  # try-only: internal [0, 0, try]
+        self._s = np.zeros(n)
+        self._tmp = np.zeros(n)
+        self._a3 = np.zeros(3)
         self._m = np.zeros((2, 4))           # per phase (search, insert): sum |rx|, sum |ry|, sum toward-hole, n
+        self._sp = np.zeros((2, 2))          # search speed scale: (near < 1 mm, far) x (sum, n)
         ctx.episode_info_hooks.append(self._episode_info)
         self._w = np.zeros(6)
         self._R = np.eye(3)
@@ -248,16 +275,23 @@ class SpiralResidual(ActionTerm):
         """Advance the base search by one policy step and send base + residual to the controller.
 
         Args:
-            a: Clipped action, shape (3,).
+            a: Clipped action, shape (dim,).
         """
+        if not self.lateral_action:
+            self._a3[2] = a[0]
+            a = self._a3
         alpha = float(self._ema[0])
         np.multiply(a, alpha, out=self._tmp)
         self._s *= 1.0 - alpha
         self._s += self._tmp
+        if self.try_action:
+            self._s[2] = a[2]                # the try level switches without smoothing
+            self.state["a_try"] = float(a[2])
         s, c, st, R = self._s, self.ctx.controller, self.state, self._R
         ee = self.ctx.plant.ee_pos
         dt = self.ctx.policy_dt
         z = float(R[:, 2] @ ee)
+        tau = 0.0
         if st["phase"] == 0:
             peg_wrench_world(self.ctx, self._w)
             if -(R[:, 2] @ self._w[:3]) > 0.5 * self.f_search:
@@ -265,6 +299,7 @@ class SpiralResidual(ActionTerm):
         if st["phase"] == 1:
             if z - self._z_touch > self.drop_th:
                 st["phase"] = 2
+                self._macro_left = 0
                 np.copyto(self._hold, ee)
                 self._gains(self.task_gains)
             else:
@@ -273,11 +308,39 @@ class SpiralResidual(ActionTerm):
                     self._out = False
                 elif not self._out and r <= 0.0:
                     self._out = True
-                speed = 1.0 if not self.speed_action else 1.0 + (s[2] if s[2] <= 0.0 else s[2] * self.speed_up)
+                if self.try_macro:
+                    if self._macro_left == 0 and s[2] >= 0.5:
+                        self._macro_left = self.try_macro
+                    tau = 1.0 if self._macro_left > 0 else 0.0
+                    self._macro_left = max(self._macro_left - 1, 0)
+                    speed = 1.0 - tau
+                    self._gains(self.task_gains if tau == 1.0 else self.search_gains)
+                elif self.try_action:
+                    tau = min(max((s[2] - self.try_dead) / (1.0 - self.try_dead), 0.0), 1.0)
+                    speed = 1.0 - tau
+                    if tau == 0.0 or tau == 1.0:     # exact end points (zero action = the scripted spiral)
+                        self._gains(self.task_gains if tau == 1.0 else self.search_gains)
+                    else:
+                        self._gains(tuple(np.exp(self._lg_s + tau * (self._lg_t - self._lg_s))))
+                elif not self.speed_action:
+                    speed = 1.0
+                elif self.speed_affine:
+                    speed = self.speed_lo + (self.speed_hi - self.speed_lo) * 0.5 * (1.0 + s[2])
+                else:
+                    speed = 1.0 + (s[2] if s[2] <= 0.0 else s[2] * self.speed_up)
+                st["speed"] = speed
                 dth = speed * self.v * dt / math.sqrt(r * r + self.b * self.b)
                 self._theta = max(0.0, self._theta + (dth if self._out else -dth))
                 r = self.b * self._theta
                 st["offset"][:] = r * math.cos(self._theta), r * math.sin(self._theta)
+        onset = tau > 0.0 and st["tau"] == 0.0
+        if tau > 0.0:
+            if onset:
+                self._try[1] += 1.0
+            st["try_t"] += dt
+        else:
+            st["try_t"] = 0.0
+        st["tau"] = tau
         if st["phase"] >= 1:
             st["depth"] = z - self._z_touch
         base = self._hold if st["phase"] == 2 else self._p0 + R[:, :2] @ st["offset"]
@@ -290,15 +353,30 @@ class SpiralResidual(ActionTerm):
             m[1] += abs(s[1]) * self.res_max
             m[2] += (s[0:2] @ to_hole) * self.res_max / n if n > 1e-9 else 0.0
             m[3] += 1.0
+            if tau > 0.0:
+                self._try[0] += 1.0
+                self._try[2] += n < 0.0005
+                self._try[3] += onset and n < 0.0005
+            if st["phase"] == 1 and "speed" in st:
+                j = 0 if n < 0.001 else 1
+                self._sp[j, 0] += st["speed"]
+                self._sp[j, 1] += 1.0
+        if self.try_macro:
+            s[2] = tau                       # applied action = the try flag
         np.dot(R[:, :2], s[0:2] * self.res_max, out=self._p)
         self._p += base
-        c.set_target(pos=self._p, f_push=self.f_insert if st["phase"] == 2 else self.f_search)
+        f = self.f_insert if st["phase"] == 2 else self.f_search + tau * (self.f_try - self.f_search)
+        c.set_target(pos=self._p, f_push=f)
 
     def reset(self) -> None:
         """Start the approach: search gains, anchor at the start position, push f_search."""
         self._s.fill(0.0)
         self._m.fill(0.0)
+        self._sp.fill(0.0)
+        self._try.fill(0.0)
         c, st = self.ctx.controller, self.state
+        st["tau"], st["try_t"] = 0.0, 0.0
+        self._macro_left = 0
         np.copyto(self._R, c.R_f)
         np.copyto(self._p0, c.p_ref)
         st["phase"], st["depth"] = 0, 0.0
@@ -313,7 +391,7 @@ class SpiralResidual(ActionTerm):
         Args:
             out: Buffer of shape (dim,).
         """
-        np.copyto(out, self._s)
+        np.copyto(out, self._s if self.lateral_action else self._s[2:])
 
     def _episode_info(self, ctx: "Context") -> dict:
         """Residual usage over the episode [mm] (logging only)."""
@@ -324,6 +402,14 @@ class SpiralResidual(ActionTerm):
             out[f"res_{ph}_absx_mm"] = 1e3 * m[0] / k
             out[f"res_{ph}_absy_mm"] = 1e3 * m[1] / k
             out[f"res_{ph}_toward_hole_mm"] = 1e3 * m[2] / k
+        if self.speed_action:
+            for j, nm in enumerate(("near", "far")):
+                out[f"speed_{nm}_hole"] = self._sp[j, 0] / self._sp[j, 1] if self._sp[j, 1] > 0 else float("nan")
+        if self.try_action:
+            out["try_steps"] = self._try[0]
+            out["try_onsets"] = self._try[1]
+            out["try_true_frac"] = self._try[2] / self._try[0] if self._try[0] > 0 else 0.0
+            out["try_onset_true_frac"] = self._try[3] / self._try[1] if self._try[1] > 0 else 0.0
         return out
 
 
@@ -479,8 +565,8 @@ def cr_curriculum_start(ctx: "Context", stages: tuple = ((0.002, 6.0, 0.0026), (
 
 
 @event_term("cr_tilt_ee")
-def cr_tilt_ee(ctx: "Context", tilt_max_deg: float = 10.0, ik_tol: float = 1e-3) -> None:
-    """Reset: tilt the gripper about the peg tip by a random angle in [0, tilt_max_deg], random direction.
+def cr_tilt_ee(ctx: "Context", tilt_max_deg: float = 10.0, ik_tol: float = 1e-3, tilt_min_deg: float = 0.0) -> None:
+    """Reset: tilt the gripper about the peg tip by a random angle in [tilt_min_deg, tilt_max_deg], random direction.
 
     The tilt axis is horizontal (a world x/y rotation, no yaw) and passes through the peg tip, so the tip
     keeps its xy position and height. Must run after `cr_reset_ee`. The controller then takes the tilted
@@ -490,11 +576,12 @@ def cr_tilt_ee(ctx: "Context", tilt_max_deg: float = 10.0, ik_tol: float = 1e-3)
         ctx: Context.
         tilt_max_deg: Max tilt magnitude [deg] (0 = no tilt).
         ik_tol: IK error above which the worst error is recorded in the episode metrics [m].
+        tilt_min_deg: Min tilt magnitude [deg] (= tilt_max_deg for a fixed tilt).
     """
     st = _st(ctx)
     m, d = ctx.model, ctx.data
     tilt = ctx.buffer("start_tilt", 2)
-    ang = math.radians(tilt_max_deg) * float(ctx.rng.uniform())
+    ang = math.radians(tilt_min_deg + (tilt_max_deg - tilt_min_deg) * float(ctx.rng.uniform()))
     phi = float(ctx.rng.uniform(0.0, 2.0 * math.pi))
     tilt[:] = ang * math.cos(phi), ang * math.sin(phi)
     if ang < 1e-12:
@@ -659,6 +746,33 @@ def sp_phase(ctx: "Context", out: np.ndarray) -> None:
     out[0] = 0.5 * ctx.state["spiral"]["phase"]
 
 
+@obs_term("sp_tcp_lat_vel", dim=2)
+def sp_tcp_lat_vel(ctx: "Context", out: np.ndarray) -> None:
+    """TCP lateral velocity in the command frame [m/s], shape (2,) (from joint encoders)."""
+    np.dot(ctx.controller.R_f[:, :2].T, ctx.plant.ee_vel()[:3], out=out)
+
+
+@obs_term("sp_tcp_tilt", dim=2)
+def sp_tcp_tilt(ctx: "Context", out: np.ndarray) -> None:
+    """TCP roll/pitch relative to the command frame (start TCP frame) [rad], small-angle, shape (2,)."""
+    Rr = ctx.controller.R_f.T @ _tcp_R(ctx)
+    out[0] = 0.5 * (Rr[2, 1] - Rr[1, 2])
+    out[1] = 0.5 * (Rr[0, 2] - Rr[2, 0])
+
+
+@obs_term("sp_try_state", dim=2)
+def sp_try_state(ctx: "Context", out: np.ndarray) -> None:
+    """Applied try-insert level tau and time since the current try started [s], shape (2,)."""
+    sp = ctx.state["spiral"]
+    out[0], out[1] = sp["tau"], sp["try_t"]
+
+
+@obs_term("episode_progress", dim=1)
+def episode_progress(ctx: "Context", out: np.ndarray) -> None:
+    """Privileged (critic): elapsed fraction of the episode, shape (1,)."""
+    out[0] = ctx.episode_step / ctx.max_episode_steps
+
+
 @obs_term("cr_peg_axis_gt", dim=3)
 def cr_peg_axis_gt(ctx: "Context", out: np.ndarray) -> None:
     """Privileged: peg axis (top -> tip) in the world frame, shape (3,); (0, 0, -1) = aligned with the hole."""
@@ -690,6 +804,22 @@ def peg_axis_angle(ctx: "Context") -> float:
 def cr_xy_aligned(ctx: "Context", tol: float = 0.0005) -> float:
     """1 while the peg tip is within `tol` [m] of the hole axis (laterally)."""
     return 1.0 if _st(ctx).xy_dist < tol else 0.0
+
+
+@reward_term("sp_try_cost")
+def sp_try_cost(ctx: "Context") -> float:
+    """Applied try-insert level tau in [0, 1] (use a negative weight)."""
+    return ctx.state["spiral"]["tau"]
+
+
+@reward_term("sp_try_action_cost")
+def sp_try_action_cost(ctx: "Context") -> float:
+    """(a + 1)^2 / 4 in [0, 1] of the raw try action a (use a negative weight).
+
+    Unlike `sp_try_cost` it is not flat below the try dead zone, so outputs that do nothing still cost a little and
+    the policy is pushed to -1 where a try does not help (instead of drifting up to the dead-zone edge).
+    """
+    return 0.25 * (ctx.state["spiral"].get("a_try", -1.0) + 1.0) ** 2
 
 
 @reward_term("cr_kp_xy")

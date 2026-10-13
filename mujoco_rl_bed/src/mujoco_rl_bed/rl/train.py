@@ -33,6 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Sequence
 
+import numpy as np
 import torch
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
@@ -221,6 +222,75 @@ class AdaptiveLRCallback(BaseCallback):
         return True
 
 
+class ProgressCallback(BaseCallback):
+    """Prints one `[progress]` line per PPO update: steps, speed, episode outcome, push statistics (tasks with a try
+    action) and the health of the last update (KL, clip fraction, entropy, explained variance).
+
+    Episode values are means over the episodes that ended during the rollout; the update values are from the update
+    on that rollout (still in the logger at the start of the next rollout, see `AdaptiveLRCallback`).
+    """
+
+    def __init__(self, total_timesteps: int) -> None:
+        """Args:
+            total_timesteps: Training length, for the progress percentage.
+        """
+        super().__init__()
+        self.total = int(total_timesteps)
+        self._ep: dict[str, list[float]] = {}
+        self._t0 = time.perf_counter()
+        self._n0 = 0
+
+    def _on_training_start(self) -> None:
+        self._t0, self._n0 = time.perf_counter(), self.model.num_timesteps
+
+    def _on_step(self) -> bool:
+        """Collect the end-of-episode infos.
+
+        Returns:
+            True (continue training).
+        """
+        for done, info in zip(self.locals["dones"], self.locals["infos"]):
+            if not done:
+                continue
+            e = self._ep
+            e.setdefault("rew", []).append(float(info.get("episode", {}).get("r", float("nan"))))
+            e.setdefault("success", []).append(float(info.get("is_success", 0.0)))
+            if info.get("time_to_success", -1.0) >= 0.0:
+                e.setdefault("t_succ", []).append(float(info["time_to_success"]))
+            if "try_onsets" in info:
+                e.setdefault("pushes", []).append(float(info["try_onsets"]))
+                e.setdefault("push_true", []).append(float(info.get("try_onset_true_frac", 0.0)) * info["try_onsets"])
+        return True
+
+    def _on_rollout_start(self) -> None:
+        """Print the line for the finished rollout + update, then reset the episode buffer."""
+        if self._ep:
+            self._print()
+
+    def _on_training_end(self) -> None:
+        if self._ep:
+            self._print()
+
+    def _print(self) -> None:
+        e, lv = self._ep, self.model.logger.name_to_value
+        n = self.model.num_timesteps
+        sps = (n - self._n0) / max(time.perf_counter() - self._t0, 1e-9)
+        parts = [f"[progress] {n:,} steps ({100 * n / max(self.total, 1):.0f} %), {sps:.0f} steps/s",
+                 f"episodes {len(e['rew'])}: success {np.mean(e['success']):.2f}, reward {np.nanmean(e['rew']):.1f}"]
+        if e.get("t_succ"):
+            parts.append(f"t_success {np.mean(e['t_succ']):.1f} s")
+        if "pushes" in e:
+            k = sum(e["pushes"])
+            parts.append(f"pushes/ep {np.mean(e['pushes']):.2f}, pushes at hole "
+                         f"{sum(e['push_true']) / k if k else 0.0:.2f}")
+        if "train/approx_kl" in lv:
+            parts.append(f"kl {lv['train/approx_kl']:.4f}, clip {lv.get('train/clip_fraction', float('nan')):.2f}, "
+                         f"entropy {-lv.get('train/entropy_loss', float('nan')):.3f}, "
+                         f"expl_var {lv.get('train/explained_variance', float('nan')):.2f}")
+        print(" | ".join(parts), flush=True)
+        self._ep = {}
+
+
 def split_overrides(raw: dict[str, str]) -> tuple[dict[str, str], dict[str, str]]:
     """Separate TrainCfg keys from EnvCfg overrides.
 
@@ -385,13 +455,14 @@ def main(argv: list[str], task_modules: Sequence[str] = (), defaults: dict[str, 
         print(f"[train] initialized from {init_ckpt} (vecnormalize: {init_vn})")
     callbacks = CallbackList([
         EpisodeInfoCallback(),
+        ProgressCallback(cfg.total_timesteps),
         *([AdaptiveLRCallback(schedule)] if schedule is not None else []),
         CheckpointCallback(save_freq=max(1, cfg.checkpoint_every // cfg.n_envs), save_path=str(run_dir / "checkpoints"),
                            name_prefix="model", save_vecnormalize=isinstance(venv, VecNormalize)),
     ])
     print(f"[train] run dir: {run_dir}")
     print(f"[train] algo={cfg.algo} task={cfg.task} n_envs={cfg.n_envs} device={model.device} "
-          f"obs_dim={venv.observation_space.shape[0]} (actor {actor_dim}) act_dim={venv.action_space.shape[0]} "
+          f"obs_dim={venv.observation_space.shape[0]} (actor {actor_dim}) act={venv.action_space} "
           f"asymmetric={cfg.asymmetric} "
           f"policy_hz={env_cfg.policy_hz:.1f}")
     t0 = time.perf_counter()
