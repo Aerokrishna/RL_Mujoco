@@ -143,6 +143,43 @@ def train_bc(pol, eps: list, epochs: int, w_pos: float, discrete: bool) -> float
                 recall = tp / max(float(lab.sum()), 1)
                 print(f"epoch {ep + 1}: held-out try recall {recall:.2f}, precision "
                       f"{tp / max(float(pred.sum()), 1):.2f}, value R2 {r2:.2f}", flush=True)
+    if discrete:
+        recall = calibrate_push(pol, forward, Xo, Xa, Xm, tr, va)
+    return recall
+
+
+def calibrate_push(pol, forward, Xo, Xa, Xm, tr, va) -> float:
+    """Shift the push logit so that push decisions best match the rule on the training episodes (max F1).
+
+    The `w_pos` weighting makes the classifier find the rare push steps but inflates every borderline push
+    probability (held-out precision ~0.2 at recall ~0.97 on the server data); the shift keeps the ranking and moves the
+    decision threshold. Prints held-out recall / precision after the shift.
+
+    Returns:
+        Held-out recall after the shift.
+    """
+    import torch as th
+
+    def margins(idx):
+        with th.no_grad():
+            out = th.cat([forward(Xo[idx[k:k + 32]])[0] for k in range(0, len(idx), 32)])
+        m = Xm[idx][..., 0] > 0
+        return (out[..., 1] - out[..., 0])[m].numpy(), (Xa[idx][..., 0] > 0)[m].numpy()
+
+    def pr(d, y, shift):
+        pred = d > shift
+        tp = float((pred & y).sum())
+        return tp / max(float(y.sum()), 1.0), tp / max(float(pred.sum()), 1.0)
+
+    d, y = margins(tr)
+    shifts = np.linspace(0.0, 10.0, 201)
+    f1 = [2 * r * q / max(r + q, 1e-9) for r, q in (pr(d, y, sh) for sh in shifts)]
+    shift = float(shifts[int(np.argmax(f1))])
+    pol.action_net.bias.data[1] -= shift
+    dv, yv = margins(va)
+    recall, precision = pr(dv, yv, 0.0)
+    print(f"[bc] push threshold calibrated (logit shift {shift:.2f}): held-out try recall {recall:.2f}, "
+          f"precision {precision:.2f}", flush=True)
     return recall
 
 
