@@ -6,7 +6,9 @@ Methods, all on the same reset seeds (shared hole-error / friction draws from `p
     trigger_policy   spiral -> hole trigger -> trained local policy (`run`)
     perfect_policy   spiral -> privileged trigger (true tip within 1 mm) -> trained local policy
 Conditions: one shape and clearance, hole yaw error exactly each of `yaws` (random sign), hole-estimate error
-U(err), friction U(friction), no tilt. The local policy's LSTM state is reset at every local-phase start.
+U(err), friction U(friction), no tilt. The local policy acts only in the local phase; its LSTM state is reset at
+every local-phase start, or runs through the whole episode with `lstm_continuous` (as in `compliant_peg_s3_handoff`
+training; "auto" picks it from the run's task).
 
 Usage (from `mujoco_rl_bed/`):
     python projects/compliant_RL/eval_s3.py run=<run_folder>
@@ -49,8 +51,9 @@ DEFAULTS = {
     "err": "0-4",                    # hole-estimate error [mm]: "a" or "a-b"
     "friction": "0.5-1.0",
     "time_max": 20.0,                # [s] per episode
-    "t_local": 3.0,                  # [s] per local phase before the spiral resumes
+    "t_local": 6.0,                  # [s] per local phase before the spiral resumes
     "deterministic": True,           # policy mean (False: sampled actions)
+    "lstm_continuous": "auto",       # True: LSTM over the whole episode; False: reset per local phase; "auto": by task
     "workers": 5,
     "out": "",
 }
@@ -141,8 +144,13 @@ def run_job(task: tuple) -> tuple:
         return method, yaw, rows, time.perf_counter() - t0
 
     uses_policy = method in ("trigger_policy", "perfect_policy")
+    continuous = False
     if uses_policy:
         model, mean, std, clip = C._load_sb3(run_dir(cfg), cfg["checkpoint"])
+        continuous = cfg["lstm_continuous"]
+        if continuous == "auto":
+            task_name = json.loads((run_dir(cfg) / "config.json").read_text())["train"]["task"]
+            continuous = task_name == "compliant_peg_s3_handoff"
     env = make_env("compliant_peg_s3", cfg, yaw)
     ctx = env.ctx
     st, sp = ctx.state["forge"], ctx.state["spiral"]
@@ -157,7 +165,7 @@ def run_job(task: tuple) -> tuple:
             orc.reset()
         if trig is not None:
             trig.reset()
-        mem.update(prev=0, since=10**6, state=None)
+        mem.update(prev=0, since=10**6, state=None, first=True)
         hand.append([])
 
     def act(o):
@@ -166,7 +174,8 @@ def run_job(task: tuple) -> tuple:
             tip = ctx.data.site_xpos[st.peg_tip]
             hand[-1].append({"off_mm": 1e3 * math.hypot(tip[0] - st.hole_tip[0], tip[1] - st.hole_tip[1]),
                              "out": "end"})
-            mem["state"] = None
+            if not continuous:
+                mem["state"] = None
         if mem["prev"] == 3 and ph != 3:
             hand[-1][-1]["out"] = "drop" if ph == 2 else "timeout"
             mem["since"] = 0
@@ -182,13 +191,14 @@ def run_job(task: tuple) -> tuple:
                     sp["trigger"] = True
         if orc is not None:
             return orc(o)
-        if ph != 3:
+        if ph != 3 and not continuous:
             return np.zeros(3)
         x = np.clip((o - mean) / std, -clip, clip).astype(np.float32)
-        start = np.array([mem["state"] is None])
+        start = np.array([mem["first"] if continuous else mem["state"] is None])
+        mem["first"] = False
         a, mem["state"] = model.predict(x[None], state=mem["state"], episode_start=start,
                                         deterministic=bool(cfg["deterministic"]))
-        return a[0]
+        return a[0] if ph == 3 else np.zeros(3)
 
     rows = C._episodes(env, seeds, bcfg, act, reset)
     for r, h in zip(rows, hand):
@@ -201,7 +211,8 @@ def summarize(res: dict, cfg: dict) -> str:
     n = int(cfg["episodes"])
     L = [f"## {cfg['shape']}, {cfg['clearance_mm']:g} mm clearance, hole error U({cfg['err']}) mm, friction "
          f"U({cfg['friction']}), {n} episodes per cell (seeds {cfg['seed']}+), {cfg['time_max']:g} s; run "
-         f"`{cfg['run'] or '-'}` ({cfg['checkpoint']}, {'deterministic' if cfg['deterministic'] else 'sampled'})", "",
+         f"`{cfg['run'] or '-'}` ({cfg['checkpoint']}, {'deterministic' if cfg['deterministic'] else 'sampled'}, "
+         f"local phase {cfg['t_local']:g} s, LSTM {cfg['lstm_continuous']})", "",
          "| method | " + " | ".join(f"yaw {y:g}°" for y in yaws) + " | all |", "|---|" + "---|" * (len(yaws) + 1)]
     for m in methods:
         cells, tot = [], 0

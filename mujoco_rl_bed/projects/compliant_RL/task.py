@@ -454,10 +454,11 @@ def compliant_peg_s3() -> TaskCfg:
       this clearance (sin + cos of the yaw error <= 1 + clearance / half side).
     - Start and spiral as `compliant_peg_s2g` (hole-estimate error U(0, 4 mm), spiral out to 4.6 mm).
     - The local phase starts when the caller sets `ctx.state["spiral"]["trigger"]` (e.g. `hole_trigger.HoleTrigger`
-      on `env.compute_obs("trigger")`); action (3) = local x, y (±1.5 mm around the freeze point) and yaw (±12°);
-      3 s per local phase, then the spiral resumes.
+      on `env.compute_obs("trigger")`, or the in-env `trigger` option of `spiral_local`); action (3) = local x, y
+      (±1.5 mm around the freeze point) and yaw (±12°); 6 s per local phase, then the spiral resumes.
     - Observations: `policy` / `critic` as `compliant_peg_s3_local` (the local-phase policy), `trigger` = the
       `compliant_peg_s2f` actor inputs (noisy) for the hole trigger.
+    - Reward: as `compliant_peg_s2` + 0.5 K(20/rad)(|yaw error|) (`cr_yaw_align`).
 
     Returns:
         A new `TaskCfg`.
@@ -467,9 +468,10 @@ def compliant_peg_s3() -> TaskCfg:
                         RectHole(name="hole", inner_half_x=0.0045, inner_half_y=0.0045)]
     params = {k: v for k, v in cfg.action.params.items() if k not in ("try_action", "lateral_action", "f_try",
                                                                      "try_dead", "res_max")}
-    params.update({"local_max": 0.0015, "yaw_max_deg": 12.0, "t_local": 3.0})
+    params.update({"local_max": 0.0015, "yaw_max_deg": 12.0, "t_local": 6.0})
     cfg.action = ActionCfg(term="spiral_local", ema_factor=0.5, params=params)
     cfg.rewards.pop("try_cost", None)
+    cfg.rewards["yaw_align"] = RewardTermCfg(weight=0.5, func="cr_yaw_align", params={"a": 20.0, "b": 0.0})
     cfg.obs = ObsCfg(
         groups={"policy": list(S3_POLICY_TERMS), "critic": list(S3_CRITIC_TERMS), "trigger": list(S2F_POLICY_TERMS)},
         term_cfg={"cr_wrench_tcp": ObsTermCfg(noise_std=(1.0, 1.0, 1.0, 0.05, 0.05, 0.05)),
@@ -518,6 +520,25 @@ def compliant_peg_s3_local() -> TaskCfg:
     ev["shift_ee"].params.update({"offset_min": 0.0, "offset_max": 0.0018})
     ev["tilt_ee"].params["tilt_max_deg"] = 0.0
     ev["hole_yaw_error"].params.update({"lo_deg": 0.0, "hi_deg": 10.0, "sym_deg": 90.0})
-    cfg.rewards["yaw_align"] = RewardTermCfg(weight=0.5, func="cr_yaw_align", params={"a": 20.0, "b": 0.0})
     cfg.episode_length_s = 6.0
+    return cfg
+
+
+@register_task("compliant_peg_s3_handoff")
+def compliant_peg_s3_handoff() -> TaskCfg:
+    """Stage 3 training on real hand-offs: the full `compliant_peg_s3` pipeline with the hole trigger in the env.
+
+    Each 20 s episode runs the spiral (hole-estimate error U(0, 4 mm), no tilt, yaw error U(0, 10°), friction
+    U(0.5, 1.0)); the hole trigger (`trigger="classifier"`) starts the local phase, so the policy trains on the
+    states the trigger actually hands over (peg caught on the edge, moving, spring deflected), including false
+    triggers and repeated local phases (6 s each, then the spiral resumes). Same observations, action and rewards
+    as `compliant_peg_s3_local`, so a `compliant_peg_s3_local` run can be fine-tuned here (`init_from`). The policy
+    acts only in the local phase; its LSTM runs through the whole episode (evaluate with `lstm_continuous`).
+
+    Returns:
+        A new `TaskCfg`.
+    """
+    cfg = compliant_peg_s3()
+    cfg.action.params["trigger"] = "classifier"
+    cfg.events["tilt_ee"].params["tilt_max_deg"] = 0.0
     return cfg

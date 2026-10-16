@@ -172,3 +172,22 @@ def test_hole_trigger_loads_and_reads_trigger_group():
         env.step(np.zeros(3))
         fired = trig(env.compute_obs("trigger"))
         assert isinstance(fired, bool) and 0.0 <= trig.p <= 1.0
+
+
+def test_s3_handoff_in_env_trigger_and_spaces_match_s3_local():
+    """compliant_peg_s3_handoff: the in-env hole trigger starts local phases during the spiral; its spaces match
+    compliant_peg_s3_local, so a run trained there can be fine-tuned here."""
+    env = make_env("compliant_peg_s3_handoff", {"obs_mode": "asymmetric"})
+    ref = make_env("compliant_peg_s3_local", {"obs_mode": "asymmetric"})
+    assert env.observation_space.shape == ref.observation_space.shape
+    assert env.action_space.shape == ref.action_space.shape and env.policy_obs_dim == ref.policy_obs_dim
+    sp = env.ctx.state["spiral"]
+    n_local = 0
+    for seed in range(4):
+        env.reset(seed=seed)
+        for _ in range(300):
+            _, _, term, trunc, _ = env.step(np.zeros(3))
+            if term or trunc or sp["phase"] == 2:
+                break
+        n_local += sp["n_local"]
+    assert n_local >= 1

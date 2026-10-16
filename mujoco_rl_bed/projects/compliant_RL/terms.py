@@ -410,6 +410,11 @@ class SpiralLocal(SpiralResidual):
     yaw target is kept). `n_local` counts the local phases of the episode. With `start_local` the first local phase
     starts right after touchdown (training on local-phase starts; the start offset comes from the reset events).
 
+    `trigger` selects who starts the local phase: "external" (the caller sets the flag), "classifier" (the hole
+    trigger, `hole_trigger.HoleTrigger`, on the env's `trigger` observation group, evaluated in the search phase at
+    the start of every step) or "oracle" (true peg tip within `trigger_r` [m] of the axis). After a local phase ends
+    the in-env triggers wait `trigger_cool` steps.
+
     Action (3): [a_x, a_y, a_yaw] in [-1, 1].
     """
 
@@ -431,6 +436,17 @@ class SpiralLocal(SpiralResidual):
         self.t_local = float(p.get("t_local", 3.0))
         self.f_local = float(p.get("f_local", self.f_search))
         self.start_local = bool(p.get("start_local", False))
+        self.trigger_mode = str(p.get("trigger", "external"))
+        if self.trigger_mode not in ("external", "classifier", "oracle"):
+            raise ValueError(f"trigger must be external | classifier | oracle, got '{self.trigger_mode}'")
+        self.trigger_cool = int(p.get("trigger_cool", 25))
+        self.trigger_r = float(p.get("trigger_r", 0.001))
+        self._since = 10**6
+        self._hole_trigger = None
+        if self.trigger_mode == "classifier":
+            from compliant_RL.hole_trigger import HoleTrigger
+
+            self._hole_trigger = HoleTrigger()
         self._loc = np.zeros(3)
         self._zero2 = np.zeros(2)
         self._anchor = np.zeros(3)
@@ -446,6 +462,14 @@ class SpiralLocal(SpiralResidual):
         st, R = self.state, self._R
         if self.start_local and st["phase"] == 1 and st["n_local"] == 0:
             st["trigger"] = True
+        self._since += 1
+        if st["phase"] == 1 and self.trigger_mode != "external" and self._since > self.trigger_cool:
+            if self._hole_trigger is not None:
+                st["trigger"] |= self._hole_trigger(self.ctx.obs_mgr.compute("trigger"))
+            else:
+                fs = _st(self.ctx)
+                tip = self.ctx.data.site_xpos[fs.peg_tip]
+                st["trigger"] |= math.hypot(tip[0] - fs.hole_tip[0], tip[1] - fs.hole_tip[1]) < self.trigger_r
         if st["phase"] == 1 and st["trigger"]:
             st["phase"], st["local_t"] = 3, 0.0
             st["n_local"] += 1
@@ -470,6 +494,7 @@ class SpiralLocal(SpiralResidual):
             return
         if st["local_t"] >= self.t_local:
             st["phase"] = 1
+            self._since = 0
             super().apply(self._zero2)
             return
         alpha = float(self._ema[0])
@@ -484,6 +509,9 @@ class SpiralLocal(SpiralResidual):
         super().reset()
         self._loc.fill(0.0)
         self._yaw_cmd = 0.0
+        self._since = 10**6
+        if self._hole_trigger is not None:
+            self._hole_trigger.reset()
         self.state.update(trigger=False, local_t=0.0, n_local=0, yaw_cmd=0.0)
         self.ctx.controller.set_target(yaw=0.0)
 

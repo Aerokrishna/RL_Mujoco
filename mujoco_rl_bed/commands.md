@@ -212,6 +212,19 @@ python projects/compliant_RL/eval_s3.py run=<run_folder>                   # end
 
 Scripted references on the training task (60 episodes): zero action 8/60, privileged `LocalOracle` 56/60.
 
+Then fine-tune on real hand-offs (`compliant_peg_s3_handoff`: full spiral with the hole trigger in the env, so the
+policy sees the states the trigger hands over; same network keys as the source run):
+
+```bash
+python -u projects/compliant_RL/train.py task=compliant_peg_s3_handoff init_from=<s3_local_run> device=cuda:1 \
+    n_envs=48 algo=recurrent_ppo asymmetric=true n_steps=128 batch_size=512 n_epochs=4 \
+    learning_rate=1e-4 lr_schedule=adaptive kl_threshold=0.008 gamma=0.99 gae_lambda=0.95 \
+    clip_range=0.2 clip_range_vf=0.2 vf_coef=1.0 ent_coef=0.0 \
+    lstm_hidden_size=256 n_lstm_layers=1 net_arch="(256,128)" activation=elu \
+    total_timesteps=3000000 checkpoint_every=500000 seed=1 run_name=s3_handoff
+python projects/compliant_RL/eval_s3.py run=<s3_handoff_run>             # LSTM runs over the whole episode (auto)
+```
+
 ## 4. Monitor training
 
 ```bash
