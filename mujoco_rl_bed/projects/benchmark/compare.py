@@ -400,7 +400,7 @@ class Recorder:
 
 # ---------------------------------------------------------------------------------- policies
 def _load_sb3(run: Path, ckpt: str = "final_model.zip"):
-    """RecurrentPPO model + its observation normalization (mean, std, clip) from a run folder.
+    """PPO or RecurrentPPO model (the run's `algo`) + its observation normalization (mean, std, clip) from a run folder.
 
     Call it before creating the env: building and first running the policy imports parts of torch
     (torch._dynamo), and that import segfaults once the MuJoCo viewer's OpenGL thread is running.
@@ -408,13 +408,16 @@ def _load_sb3(run: Path, ckpt: str = "final_model.zip"):
     import re
 
     from sb3_contrib import RecurrentPPO
+    from stable_baselines3 import PPO
 
+    conf = run / "config.json"
+    algo = json.loads(conf.read_text())["train"]["algo"] if conf.is_file() else "recurrent_ppo"
     zp = run / ckpt
     vn = run / "vecnormalize.pkl"
     m = re.search(r"model_(\d+)_steps\.zip$", zp.name)
     if m:
         vn = zp.parent / f"model_vecnormalize_{m.group(1)}_steps.pkl"
-    model = RecurrentPPO.load(str(zp), device="cpu")
+    model = (RecurrentPPO if algo == "recurrent_ppo" else PPO).load(str(zp), device="cpu")
     with open(vn, "rb") as f:
         v = pickle.load(f)
     # Warm-up prediction: the first forward pass imports more of torch, which segfaults once the viewer runs.
