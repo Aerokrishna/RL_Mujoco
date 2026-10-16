@@ -17,6 +17,7 @@ dependencies = [
     "sb3-contrib>=2.3",
     "tensorboard>=2.10",
     "pyyaml>=6",
+    "scikit-learn==1.7.0",     # the hole trigger classifier (compliant_RL/models) is a pickled 1.7.0 model
 ]
 
 [project.optional-dependencies]

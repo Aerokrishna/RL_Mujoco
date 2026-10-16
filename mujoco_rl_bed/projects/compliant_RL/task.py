@@ -162,8 +162,9 @@ def compliant_peg_s2() -> TaskCfg:
       (wrong) hole estimate: the spiral is centred on it.
     - Base (zero residual, `spiral_residual`): approach at 1 N, spiral of the lateral anchor in the start TCP
       frame (pitch 0.8 mm, 10 mm/s, out to 2.6 mm) with stiff search gains (k_lat 2000, k_tilt 3), on a
-      0.5 mm drop switch to the controller gains (k_lat 200, k_tilt 0.1) and push 5 N. Scripted, this inserts
-      57-62 % of episodes within 10 s.
+      2 mm drop switch to the controller gains (k_lat 200, k_tilt 0.1) and push 5 N. Scripted (with the earlier
+      0.5 mm drop threshold, which fired falsely on tilted and large pegs), this inserts 57-62 % of episodes
+      within 10 s.
     - Action (3): lateral residual on the anchor (±1 mm) and spiral speed scale ([0, 2]).
     - Actor observation (15): contact wrench about the TCP in the TCP frame (6, step mean, noise 1 N / 0.05 Nm),
       spiral base offset (2), depth since touchdown (1), lateral spring deflection (2), phase (1), previous
@@ -180,7 +181,7 @@ def compliant_peg_s2() -> TaskCfg:
     cfg = compliant_peg_s1()
     cfg.action = ActionCfg(term="spiral_residual", ema_factor=0.5,
                            params={"f_search": 1.0, "f_insert": 5.0, "v": 0.01, "pitch": 0.0008, "r_max": 0.0026,
-                                   "drop_th": 0.0005, "res_max": 0.001, "ks_lat": 2000.0, "ds_lat": 190.0,
+                                   "drop_th": 0.002, "res_max": 0.001, "ks_lat": 2000.0, "ds_lat": 190.0,
                                    "ks_tilt": 3.0, "ds_tilt": 1.5})
     cfg.obs = ObsCfg(
         groups={"policy": list(S2_POLICY_TERMS), "critic": list(S2_CRITIC_TERMS)},
@@ -433,4 +434,90 @@ def compliant_peg_s2i() -> TaskCfg:
     cfg = compliant_peg_s2g()
     cfg.action.params["try_macro"] = 15
     cfg.obs.groups = {"policy": list(S2I_POLICY_TERMS), "critic": list(S2I_CRITIC_TERMS)}
+    return cfg
+
+
+# Local-phase actor / critic; the hole trigger (`hole_trigger.HoleTrigger`) reads the `trigger` group, which is the
+# `compliant_peg_s2f` actor layout it was trained on.
+S3_POLICY_TERMS = ["cr_wrench_tcp", "cr_spring_defl", "sp_tcp_lat_vel", "sp_tcp_tilt", "sp_depth", "sp_local_offset",
+                   "sp_tcp_yaw", "sp_local_time", "last_action"]
+S3_CRITIC_TERMS = ["peg_tip_rel_hole_gt", "cr_yaw_err_gt", "cr_peg_axis_gt", "success_gt", "part_params_gt",
+                   "contact_force", "episode_progress"] + S3_POLICY_TERMS
+
+
+@register_task("compliant_peg_s3")
+def compliant_peg_s3() -> TaskCfg:
+    """Stage 3: spiral search + local x, y, yaw correction (`spiral_local`) on a cuboid with a hole yaw error.
+
+    - Parts: 8 x 8 mm cuboid peg, 9 x 9 mm hole (0.5 mm radial clearance), turned to the gripper yaw at startup and
+      then off by U(0, 10°) (random sign) per episode (`cr_hole_yaw_error`). A square peg only fits within ~7° at
+      this clearance (sin + cos of the yaw error <= 1 + clearance / half side).
+    - Start and spiral as `compliant_peg_s2g` (hole-estimate error U(0, 4 mm), spiral out to 4.6 mm).
+    - The local phase starts when the caller sets `ctx.state["spiral"]["trigger"]` (e.g. `hole_trigger.HoleTrigger`
+      on `env.compute_obs("trigger")`); action (3) = local x, y (±1.5 mm around the freeze point) and yaw (±12°);
+      3 s per local phase, then the spiral resumes.
+    - Observations: `policy` / `critic` as `compliant_peg_s3_local` (the local-phase policy), `trigger` = the
+      `compliant_peg_s2f` actor inputs (noisy) for the hole trigger.
+
+    Returns:
+        A new `TaskCfg`.
+    """
+    cfg = compliant_peg_s2g()
+    cfg.scene.assets = [BoxPeg(name="peg", half_x=0.004, half_y=0.004),
+                        RectHole(name="hole", inner_half_x=0.0045, inner_half_y=0.0045)]
+    params = {k: v for k, v in cfg.action.params.items() if k not in ("try_action", "lateral_action", "f_try",
+                                                                     "try_dead", "res_max")}
+    params.update({"local_max": 0.0015, "yaw_max_deg": 12.0, "t_local": 3.0})
+    cfg.action = ActionCfg(term="spiral_local", ema_factor=0.5, params=params)
+    cfg.rewards.pop("try_cost", None)
+    cfg.obs = ObsCfg(
+        groups={"policy": list(S3_POLICY_TERMS), "critic": list(S3_CRITIC_TERMS), "trigger": list(S2F_POLICY_TERMS)},
+        term_cfg={"cr_wrench_tcp": ObsTermCfg(noise_std=(1.0, 1.0, 1.0, 0.05, 0.05, 0.05)),
+                  "sp_tcp_lat_vel": ObsTermCfg(noise_std=0.001),
+                  "sp_tcp_tilt": ObsTermCfg(noise_std=0.001),
+                  "sp_local_offset": ObsTermCfg(noise_std=0.00025),
+                  "sp_tcp_yaw": ObsTermCfg(noise_std=0.002)},
+        noisy_groups=("policy", "trigger"),
+    )
+    events = {}
+    for k, v in cfg.events.items():
+        events[k] = v
+        if k == "init":
+            events["align_hole_yaw"] = EventTermCfg(mode="startup", func="cr_align_hole_yaw")
+        if k == "reset_fixed":
+            events["hole_yaw_error"] = EventTermCfg(mode="reset", func="cr_hole_yaw_error",
+                                                    params={"lo_deg": 0.0, "hi_deg": 10.0})
+    cfg.events = events
+    return cfg
+
+
+@register_task("compliant_peg_s3_local")
+def compliant_peg_s3_local() -> TaskCfg:
+    """Stage 3 training task: the local phase of `compliant_peg_s3` on its own (episodes start at the hand-off).
+
+    - Start: peg tip 2 mm above the opening, U(0, 1.8 mm) off the hole axis (random direction; ~17 % beyond the
+      1.5 mm action range, like the trigger's far hand-offs), hole yaw error U(0, 10°) with random sign, no tilt,
+      friction U(0.5, 1.0). Approach at 1.5 N; at touchdown the local phase starts (`start_local`) and lasts the
+      rest of the episode (6 s); a 2 mm drop switches to the scripted insert (soft gains, 5 N).
+    - Action (3): lateral anchor target ±1.5 mm around the touchdown point and yaw target ±12° (EMA 0.5; search gains,
+      1.5 N push). Ignored during the approach and the insert.
+    - Actor observation (20): contact wrench (6, noise 1 N / 0.05 Nm), spring deflection (2), TCP lateral velocity
+      (2, noise 1 mm/s), roll/pitch (2, noise 1 mrad), depth (1), TCP offset from the touchdown point (2, noise
+      0.25 mm), TCP yaw (1, noise 2 mrad), time in the local phase (1), previous applied action (3). Meant for a
+      recurrent policy. Critic: actor terms (clean) + true tip offset, true yaw error, peg axis, success label, part
+      parameters, contact force, episode progress.
+    - Reward: as `compliant_peg_s2` (K_coarse + K_fine + 0.5 K_xy + I_place + I_success - 0.2 contact penalty
+      - 0.1 action rate - 0.01 ||a||^2) + 0.5 K(20/rad)(|yaw error|).
+
+    Returns:
+        A new `TaskCfg`.
+    """
+    cfg = compliant_peg_s3()
+    cfg.action.params.update({"start_local": True, "t_local": 1e9})
+    ev = cfg.events
+    ev["shift_ee"].params.update({"offset_min": 0.0, "offset_max": 0.0018})
+    ev["tilt_ee"].params["tilt_max_deg"] = 0.0
+    ev["hole_yaw_error"].params.update({"lo_deg": 0.0, "hi_deg": 10.0, "sym_deg": 90.0})
+    cfg.rewards["yaw_align"] = RewardTermCfg(weight=0.5, func="cr_yaw_align", params={"a": 20.0, "b": 0.0})
+    cfg.episode_length_s = 6.0
     return cfg

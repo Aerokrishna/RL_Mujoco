@@ -112,3 +112,63 @@ def test_s2f_try_action():
     assert c.f_push == term.f_try
     env.step(np.zeros(3))
     assert sp["tau"] == 0.0 and c.k_lin[0] == term.search_gains[0]
+
+
+def _yaw_deg(env) -> float:
+    """Peg yaw about world z [deg]."""
+    import mujoco
+
+    m, d = env.ctx.model, env.ctx.data
+    g = d.geom_xmat[mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "peg_geom")]
+    return float(np.degrees(np.arctan2(g[3], g[0])))
+
+
+def test_s3_trigger_starts_local_phase_and_yaw_target_turns_peg():
+    """spiral_local: a trigger in the search phase freezes the spiral; the yaw action turns the peg (sign: the tool
+    axis points down, so +yaw command = -yaw about world z)."""
+    env = make_env("compliant_peg_s3", {"task.events.hole_yaw_error.params.hi_deg": "0"})
+    sp = env.ctx.state["spiral"]
+    env.reset(seed=1)
+    for t in range(110):
+        if t == 50:
+            sp["trigger"] = True
+        env.step(np.array([0.0, 0.0, 0.5 if t >= 50 else 0.0]))
+        if t == 49:
+            assert sp["phase"] == 1 and sp["n_local"] == 0
+            yaw0 = _yaw_deg(env)
+    assert sp["phase"] == 3 and sp["n_local"] == 1
+    assert abs(np.degrees(sp["yaw_cmd"]) - 6.0) < 1e-6
+    assert abs(_yaw_deg(env) - yaw0 + 6.0) < 0.2
+
+
+def test_s3_local_oracle_inserts():
+    """compliant_peg_s3_local: the privileged LocalOracle corrects offset and yaw and inserts; zero action rarely."""
+    from compliant_RL.scripted import LocalOracle
+
+    env = make_env("compliant_peg_s3_local", {"task.events.shift_ee.params.offset_max": "0.0012",
+                                              "task.events.hole_yaw_error.params.lo_deg": "8.0",
+                                              "task.events.hole_yaw_error.params.hi_deg": "8.0"})
+    st, sp = env.ctx.state["forge"], env.ctx.state["spiral"]
+    orc = LocalOracle(env)
+    for seed in range(3):
+        obs, _ = env.reset(seed=seed)
+        orc.reset()
+        while True:
+            obs, _, term, trunc, _ = env.step(orc(obs))
+            if term or trunc:
+                break
+        assert sp["n_local"] == 1
+        assert st.first_success_step >= 0, f"seed {seed}"
+
+
+def test_hole_trigger_loads_and_reads_trigger_group():
+    """The shipped hole-trigger classifier loads and scores the `trigger` observation group of compliant_peg_s3."""
+    from compliant_RL.hole_trigger import HoleTrigger
+
+    env = make_env("compliant_peg_s3", {})
+    env.reset(seed=0)
+    trig = HoleTrigger()
+    for _ in range(5):
+        env.step(np.zeros(3))
+        fired = trig(env.compute_obs("trigger"))
+        assert isinstance(fired, bool) and 0.0 <= trig.p <= 1.0

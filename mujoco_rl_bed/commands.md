@@ -192,6 +192,26 @@ screen -dmS spiral bash -c "python projects/compliant_RL/train.py task=compliant
 
 Runs go to `projects/compliant_RL/runs/<task>_<date>_s<seed>[_<run_name>]/`.
 
+### 3b. Spiral + local x, y, yaw correction (cuboid with a hole yaw error)
+
+The spiral searches; a hole-trigger classifier (`projects/compliant_RL/hole_trigger.py`, model in `models/`) stops it
+near the hole; a learned local policy then moves the anchor (±1.5 mm) and turns the peg (±12°) until it drops in.
+Training task `compliant_peg_s3_local` starts every episode at the hand-off (cuboid 8 mm, 0.5 mm clearance, start
+0-1.8 mm off the axis, yaw error 0-10°); `compliant_peg_s3` is the full pipeline.
+
+```bash
+python -u projects/compliant_RL/train.py task=compliant_peg_s3_local device=cuda:1 n_envs=48 \
+    algo=recurrent_ppo asymmetric=true n_steps=128 batch_size=512 n_epochs=4 \
+    learning_rate=1e-4 lr_schedule=adaptive kl_threshold=0.008 gamma=0.99 gae_lambda=0.95 \
+    clip_range=0.2 clip_range_vf=0.2 vf_coef=1.0 ent_coef=0.0 log_std_init=-0.5 \
+    lstm_hidden_size=256 n_lstm_layers=1 net_arch="(256,128)" activation=elu \
+    total_timesteps=5000000 checkpoint_every=500000 seed=0 run_name=s3_local
+python projects/compliant_RL/eval.py run=<run_folder> episodes=50          # on the training task
+python projects/compliant_RL/eval_s3.py run=<run_folder>                   # end to end vs today's pipeline
+```
+
+Scripted references on the training task (60 episodes): zero action 8/60, privileged `LocalOracle` 56/60.
+
 ## 4. Monitor training
 
 ```bash

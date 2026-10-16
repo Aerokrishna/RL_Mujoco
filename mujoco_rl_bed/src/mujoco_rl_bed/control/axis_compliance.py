@@ -21,7 +21,7 @@ low-pass filtered), e = R_f^T (x_c - p_ref) the offset from the reference positi
 The rotational line is written in the A-rotated virtual frame (q_c A, whose z is the motion axis on the
 tool): r is the rotation from q_c to q_target = q_ref * exp(A [tilt_x, tilt_y, 0]), w the virtual angular
 velocity and T the measured torque, all in that frame. Roll/pitch are about the command x, y axes; yaw
-is the rotation about the motion axis. The inner loop tracks the virtual frame:
+is the rotation about the motion axis (a yaw target from `set_target(yaw=...)` adds A [0, 0, yaw]). The inner loop tracks the virtual frame:
 
     tau = J^T [ Kp_in (x_c - p) + Kd_in (v_c - v) ; Kr_in (q_c ⊖ q) + Dr_in (w_c - w) ]
           + (I - J^T J#^T) tau_null + qfrc_bias
@@ -180,6 +180,7 @@ class AxisCompliance:
         self.f_lat = np.zeros(2)
         self.f_push = 0.0
         self.tilt = np.zeros(2)
+        self.yaw = 0.0
         self.x_c = np.zeros(3)
         self.v_c = np.zeros(3)          # world frame
         self.q_c = np.array([1.0, 0.0, 0.0, 0.0])
@@ -226,7 +227,7 @@ class AxisCompliance:
 
     def set_target(self, pos: np.ndarray | None = None, quat: np.ndarray | None = None,
                    f_lat: np.ndarray | None = None, f_push: float | None = None,
-                   tilt: np.ndarray | None = None) -> None:
+                   tilt: np.ndarray | None = None, yaw: float | None = None) -> None:
         """Set the reference pose and/or the commands (once per policy step).
 
         Args:
@@ -236,6 +237,7 @@ class AxisCompliance:
             f_lat: Commanded side force along the command frame's x, y [N], shape (2,).
             f_push: Commanded force along the motion axis [N] (positive = along `axis_tcp`).
             tilt: Tilt target about the command frame's x, y axes [rad], shape (2,).
+            yaw: Yaw target about the motion axis [rad] (held by the yaw spring; external yaw torque is ignored).
         """
         if pos is not None:
             np.copyto(self.p_ref, pos)
@@ -249,8 +251,10 @@ class AxisCompliance:
             self.f_push = float(f_push)
         if tilt is not None:
             np.copyto(self.tilt, tilt)
-        if quat is not None or tilt is not None:
-            self._tmp3[:] = self.A[:, 0] * self.tilt[0] + self.A[:, 1] * self.tilt[1]   # TCP-frame axis
+        if yaw is not None:
+            self.yaw = float(yaw)
+        if quat is not None or tilt is not None or yaw is not None:
+            self._tmp3[:] = self.A[:, 0] * self.tilt[0] + self.A[:, 1] * self.tilt[1] + self.A[:, 2] * self.yaw
             angle = float(np.linalg.norm(self._tmp3))
             if angle > 1e-12:
                 mujoco.mju_axisAngle2Quat(self._tilt_q, self._tmp3 / angle, angle)
@@ -269,6 +273,7 @@ class AxisCompliance:
         self.f_lat.fill(0.0)
         self.f_push = 0.0
         self.tilt.fill(0.0)
+        self.yaw = 0.0
         np.copyto(self.x_c, plant.ee_pos)
         self.v_c.fill(0.0)
         np.copyto(self.q_c, plant.ee_quat())

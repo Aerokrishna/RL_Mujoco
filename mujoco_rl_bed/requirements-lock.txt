@@ -10,5 +10,6 @@ sb3-contrib==2.9.0
 torch==2.14.0
 tensorboard==2.19.0
 pyyaml==6.0.2
+scikit-learn==1.7.0   # unpickles projects/compliant_RL/models/hole_trigger_classifier.pkl
 onnxruntime==1.23.2
 pytest==9.1.1

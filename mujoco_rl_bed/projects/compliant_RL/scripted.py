@@ -6,6 +6,9 @@ reads only the actor observation and is the teacher of the warm start (`bc_warms
 `ScriptedCorrector`: privileged scripted corrector for `compliant_peg` (validates the residual action space; not
 deployable).
 
+`LocalOracle`: privileged local-phase corrector for `compliant_peg_s3` (`spiral_local`): the ceiling of the local
+x, y, yaw correction (not deployable).
+
 It reads the true peg tip and grasp tilt and outputs the same 5D residual as the policy:
 
     f_lat = -K e - Ki ∫e + k_lat (x_c - p_ref)      PI on the tip's lateral error e (command frame),
@@ -21,6 +24,7 @@ from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
 
+import mujoco
 import numpy as np
 
 if TYPE_CHECKING:
@@ -112,3 +116,62 @@ class ScriptedCorrector:
         a[2] = -1.0 if np.linalg.norm(e) > self.tol and tip[2] > st.hole_tip[2] - 0.002 else 0.0
         a[3:5] = np.clip(-self.env.ctx.state["grasp_tilt"] / self.tilt_max, -1.0, 1.0)
         return a
+
+
+class LocalOracle:
+    """Privileged local phase for `spiral_local`: steer the true peg tip over the hole axis and turn to the hole yaw.
+
+    Per step in the local phase: the anchor offset integrates the tip's lateral error (command frame, gain `gain`
+    per step, clipped to the action range), and the yaw command integrates the peg-to-hole yaw error (wrapped to
+    ± half the shape's symmetry angle `sym_deg`: 90° square, 60° hexagon, 45° octagon; a positive yaw command turns
+    the peg negatively about world z because the tool axis points down). Outside the local phase it holds the last yaw command. `xy=False` / `yaw=False` disable a part.
+    """
+
+    def __init__(self, env: "TorqueEnv", gain: float = 0.3, yaw_gain: float = 0.5, xy: bool = True,
+                 yaw: bool = True, sym_deg: float = 90.0) -> None:
+        """Cache handles.
+
+        Args:
+            env: A `compliant_peg_s3` env.
+            gain: Lateral integral gain (fraction of the tip error added to the offset per step).
+            yaw_gain: Yaw integral gain (fraction of the yaw error added per step).
+            xy: Correct the lateral offset.
+            yaw: Correct the yaw.
+            sym_deg: Rotational symmetry of the cross-section [deg] (90 square, 60 hexagon, 45 octagon).
+        """
+        ctx = env.ctx
+        self.ctx, self.st, self.sp, self.term = ctx, ctx.state["forge"], ctx.state["spiral"], ctx.state["spiral_term"]
+        m = ctx.model
+        self.peg_geom = mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "peg_geom")
+        self.hole_body = int(np.flatnonzero(m.body_mocapid == self.st.hole_mocap)[0])
+        self.gain, self.yaw_gain, self.xy, self.yaw = gain, yaw_gain, xy, yaw
+        self.sym = math.radians(sym_deg)
+        self.reset()
+
+    def reset(self) -> None:
+        """Clear the integrators (call after `env.reset`)."""
+        self.off = np.zeros(2)
+        self.ycmd = 0.0
+        self.n_local = 0
+
+    def yaw_error(self) -> float:
+        """Hole yaw minus peg yaw about world z, wrapped to [-sym / 2, sym / 2) [rad]."""
+        d = self.ctx.data
+        pg, hb = d.geom_xmat[self.peg_geom], d.xmat[self.hole_body]
+        dphi = math.atan2(hb[3], hb[0]) - math.atan2(pg[3], pg[0])
+        return (dphi + 0.5 * self.sym) % self.sym - 0.5 * self.sym
+
+    def __call__(self, o: np.ndarray | None = None) -> np.ndarray:
+        """Local action [a_x, a_y, a_yaw] for the current state."""
+        t, sp = self.term, self.sp
+        if sp["phase"] != 3:
+            return np.array([0.0, 0.0, self.ycmd / t.yaw_max])
+        if sp["n_local"] != self.n_local:                   # a new local phase starts at the freeze point
+            self.n_local, self.off[:] = sp["n_local"], 0.0
+        if self.xy:
+            tip, hole = self.ctx.data.site_xpos[self.st.peg_tip], self.st.hole_tip
+            e = t._R[:, :2].T @ np.array([hole[0] - tip[0], hole[1] - tip[1], 0.0])
+            self.off = np.clip(self.off + self.gain * e, -t.local_max, t.local_max)
+        if self.yaw:
+            self.ycmd = float(np.clip(self.ycmd - self.yaw_gain * self.yaw_error(), -t.yaw_max, t.yaw_max))
+        return np.array([self.off[0] / t.local_max, self.off[1] / t.local_max, self.ycmd / t.yaw_max])

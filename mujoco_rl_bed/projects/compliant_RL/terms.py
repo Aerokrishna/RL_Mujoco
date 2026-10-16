@@ -214,7 +214,7 @@ class SpiralResidual(ActionTerm):
         self.v = float(p.get("v", 0.01))
         self.b = float(p.get("pitch", 0.0008)) / (2.0 * math.pi)
         self.r_max = float(p.get("r_max", 0.0026))
-        self.drop_th = float(p.get("drop_th", 0.0005))
+        self.drop_th = float(p.get("drop_th", 0.002))
         self.res_max = float(p.get("res_max", 0.001))
         self.speed_up = float(p.get("speed_max", 2.0)) - 1.0
         self.speed_affine = bool(p.get("speed_affine", False))
@@ -393,6 +393,113 @@ class SpiralResidual(ActionTerm):
         return out
 
 
+@action_term("spiral_local")
+class SpiralLocal(SpiralResidual):
+    """`spiral_residual`'s scripted spiral (no residual) plus a local x, y, yaw correction phase after a trigger.
+
+    Phases (`ctx.state["spiral"]["phase"]`): 0 approach, 1 search, 3 local, 2 insert. The action only acts in the
+    local phase. A trigger (`ctx.state["spiral"]["trigger"] = True`, set by the caller before a step, e.g. from a
+    force rule; read in the search phase only) freezes the spiral and starts the local phase:
+
+        lateral anchor = freeze point + R_f [a_x, a_y] local_max      (search gains: stiff lateral, stiff tilt)
+        yaw target     = a_yaw yaw_max about the tool axis             (controller yaw spring)
+        push           = f_local
+
+    with a = the EMA-smoothed action (`ema_factor`). A drop (TCP `drop_th` further along R_f z than at touchdown)
+    switches to insert as in the spiral; after `t_local` [s] without one the spiral resumes where it stopped (the
+    yaw target is kept). `n_local` counts the local phases of the episode. With `start_local` the first local phase
+    starts right after touchdown (training on local-phase starts; the start offset comes from the reset events).
+
+    Action (3): [a_x, a_y, a_yaw] in [-1, 1].
+    """
+
+    def __init__(self, cfg: ActionCfg, ctx: "Context") -> None:
+        """Read the parameters (spiral ones as `spiral_residual`) and allocate buffers.
+
+        Args:
+            cfg: Action configuration.
+            ctx: Shared context.
+        """
+        p = cfg.params
+        base = ActionCfg(term=cfg.term, ema_factor=cfg.ema_factor,
+                         params={**p, "try_action": False, "speed_action": False, "lateral_action": True,
+                                 "res_max": 0.0})
+        super().__init__(base, ctx)
+        self.dim = 3
+        self.local_max = float(p.get("local_max", 0.0015))
+        self.yaw_max = math.radians(float(p.get("yaw_max_deg", 12.0)))
+        self.t_local = float(p.get("t_local", 3.0))
+        self.f_local = float(p.get("f_local", self.f_search))
+        self.start_local = bool(p.get("start_local", False))
+        self._loc = np.zeros(3)
+        self._zero2 = np.zeros(2)
+        self._anchor = np.zeros(3)
+        self._yaw_cmd = 0.0
+        self.state.update(trigger=False, local_t=0.0, n_local=0, yaw_cmd=0.0)
+
+    def apply(self, a: np.ndarray) -> None:
+        """Spiral (phases 0-2, as `spiral_residual` with zero residual) or one local-phase step.
+
+        Args:
+            a: Clipped action, shape (3,).
+        """
+        st, R = self.state, self._R
+        if self.start_local and st["phase"] == 1 and st["n_local"] == 0:
+            st["trigger"] = True
+        if st["phase"] == 1 and st["trigger"]:
+            st["phase"], st["local_t"] = 3, 0.0
+            st["n_local"] += 1
+            np.copyto(self._anchor, self._p0 + R[:, :2] @ st["offset"])
+            self._loc[:2] = 0.0
+            self._loc[2] = self._yaw_cmd / self.yaw_max
+            self._gains(self.search_gains)
+        st["trigger"] = False
+        if st["phase"] != 3:
+            super().apply(self._zero2)
+            return
+        c = self.ctx.controller
+        ee = self.ctx.plant.ee_pos
+        z = float(R[:, 2] @ ee)
+        st["local_t"] += self.ctx.policy_dt
+        st["depth"] = z - self._z_touch
+        if z - self._z_touch > self.drop_th:
+            st["phase"] = 2
+            np.copyto(self._hold, ee)
+            self._gains(self.task_gains)
+            c.set_target(pos=self._hold, f_push=self.f_insert)
+            return
+        if st["local_t"] >= self.t_local:
+            st["phase"] = 1
+            super().apply(self._zero2)
+            return
+        alpha = float(self._ema[0])
+        self._loc += alpha * (a - self._loc)
+        np.dot(R[:, :2], self._loc[:2] * self.local_max, out=self._p)
+        self._p += self._anchor
+        self._yaw_cmd = st["yaw_cmd"] = float(self._loc[2]) * self.yaw_max
+        c.set_target(pos=self._p, f_push=self.f_local, yaw=self._yaw_cmd)
+
+    def reset(self) -> None:
+        """Start the approach (as `spiral_residual`) with no yaw command."""
+        super().reset()
+        self._loc.fill(0.0)
+        self._yaw_cmd = 0.0
+        self.state.update(trigger=False, local_t=0.0, n_local=0, yaw_cmd=0.0)
+        self.ctx.controller.set_target(yaw=0.0)
+
+    def write_applied(self, out: np.ndarray) -> None:
+        """Applied (smoothed) local action.
+
+        Args:
+            out: Buffer of shape (3,).
+        """
+        np.copyto(out, self._loc)
+
+    def _episode_info(self, ctx: "Context") -> dict:
+        """Spiral metrics plus the number of local phases."""
+        return {**super()._episode_info(ctx), "n_local": float(self.state["n_local"])}
+
+
 # ---------------------------------------------------------------------------------- events
 @event_term("cr_randomize_grasp")
 def cr_randomize_grasp(ctx: "Context", tilt_max_deg: float = 3.0) -> None:
@@ -477,6 +584,28 @@ def cr_align_hole_yaw(ctx: "Context") -> None:
     ctx.model.body_quat[hole_body] = q
     ctx.data.mocap_quat[st.hole_mocap] = q
     ctx.state["hole_yaw"] = yaw
+
+
+@event_term("cr_hole_yaw_error")
+def cr_hole_yaw_error(ctx: "Context", lo_deg: float = 0.0, hi_deg: float = 10.0, sym_deg: float = 90.0) -> None:
+    """Reset: turn the socket about the world z axis by U(lo_deg, hi_deg), random sign, from its aligned yaw.
+
+    The aligned yaw is the TCP yaw at home (`cr_align_hole_yaw`, startup; 0 without it). Must run after the socket
+    reset (`forge_reset_fixed`). Writes `ctx.state["hole_yaw_err"]` [rad] and the cross-section symmetry
+    `ctx.state["yaw_sym"]` [rad] used by `hole_yaw_error`.
+
+    Args:
+        ctx: Context.
+        lo_deg: Min yaw error magnitude [deg].
+        hi_deg: Max yaw error magnitude [deg].
+        sym_deg: Rotational symmetry of the cross-section [deg] (90 square, 60 hexagon, 45 octagon).
+    """
+    ctx.state["yaw_sym"] = math.radians(sym_deg)
+    st = _st(ctx)
+    err = math.radians(float(ctx.rng.uniform(lo_deg, hi_deg))) * (1.0 if ctx.rng.uniform() < 0.5 else -1.0)
+    yaw = float(ctx.state.get("hole_yaw", 0.0)) + err
+    ctx.data.mocap_quat[st.hole_mocap] = (math.cos(0.5 * yaw), 0.0, 0.0, math.sin(0.5 * yaw))
+    ctx.state["hole_yaw_err"] = err
 
 
 @event_term("cr_shift_ee")
@@ -766,6 +895,60 @@ def cr_grasp_tilt_gt(ctx: "Context", out: np.ndarray) -> None:
     np.copyto(out, ctx.buffer("grasp_tilt", 2))
 
 
+def hole_yaw_error(ctx: "Context") -> float:
+    """Hole yaw minus peg yaw about world z [rad], wrapped to ± half the cross-section symmetry.
+
+    The symmetry comes from `cr_hole_yaw_error` (`ctx.state["yaw_sym"]`, default 90°, a square).
+
+    Args:
+        ctx: Context.
+
+    Returns:
+        Yaw error [rad].
+    """
+    ids = ctx.state.get("cr_yaw_ids")
+    if ids is None:
+        m = ctx.model
+        ids = ctx.state["cr_yaw_ids"] = (mujoco.mj_name2id(m, mujoco.mjtObj.mjOBJ_GEOM, "peg_geom"),
+                                         int(np.flatnonzero(m.body_mocapid == _st(ctx).hole_mocap)[0]))
+    d = ctx.data
+    pg, hb = d.geom_xmat[ids[0]], d.xmat[ids[1]]
+    sym = float(ctx.state.get("yaw_sym", 0.5 * math.pi))
+    dphi = math.atan2(hb[3], hb[0]) - math.atan2(pg[3], pg[0])
+    return (dphi + 0.5 * sym) % sym - 0.5 * sym
+
+
+@obs_term("sp_local_offset", dim=2)
+def sp_local_offset(ctx: "Context", out: np.ndarray) -> None:
+    """TCP lateral position relative to the local-phase freeze point, command frame [m], shape (2,) (0 before the
+    first local phase; needs `spiral_local`)."""
+    t = ctx.state["spiral_term"]
+    if ctx.state["spiral"]["n_local"] == 0:
+        out[:] = 0.0
+        return
+    np.dot(t._R[:, :2].T, ctx.plant.ee_pos - t._anchor, out=out)
+
+
+@obs_term("sp_tcp_yaw", dim=1)
+def sp_tcp_yaw(ctx: "Context", out: np.ndarray) -> None:
+    """TCP yaw about the tool axis relative to the command frame (start TCP frame) [rad], small-angle, shape (1,)."""
+    Rr = ctx.controller.R_f.T @ _tcp_R(ctx)
+    out[0] = 0.5 * (Rr[1, 0] - Rr[0, 1])
+
+
+@obs_term("sp_local_time", dim=1)
+def sp_local_time(ctx: "Context", out: np.ndarray) -> None:
+    """Time in the current local phase [s], shape (1,) (0 outside it; needs `spiral_local`)."""
+    sp = ctx.state["spiral"]
+    out[0] = sp["local_t"] if sp["phase"] == 3 else 0.0
+
+
+@obs_term("cr_yaw_err_gt", dim=1)
+def cr_yaw_err_gt(ctx: "Context", out: np.ndarray) -> None:
+    """True hole-minus-peg yaw error (`hole_yaw_error`) [rad], shape (1,) (privileged)."""
+    out[0] = hole_yaw_error(ctx)
+
+
 # ---------------------------------------------------------------------------------- rewards
 def peg_axis_angle(ctx: "Context") -> float:
     """Angle between the peg axis and the hole axis [rad].
@@ -800,6 +983,13 @@ def sp_try_action_cost(ctx: "Context") -> float:
     the policy is pushed to -1 where a try does not help (instead of drifting up to the dead-zone edge).
     """
     return 0.25 * (ctx.state["spiral"].get("a_try", -1.0) + 1.0) ** 2
+
+
+@reward_term("cr_yaw_align")
+def cr_yaw_align(ctx: "Context", a: float = 20.0, b: float = 0.0) -> float:
+    """Yaw alignment kernel K_{a,b}(|hole_yaw_error|) (a in 1/rad). The keypoint kernels lie on the peg axis and
+    do not see yaw."""
+    return logistic_kernel(abs(hole_yaw_error(ctx)), a, b)
 
 
 @reward_term("cr_kp_xy")
