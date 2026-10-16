@@ -28,6 +28,7 @@ from mujoco_rl_bed.env.managers.action import ActionTerm, action_term
 from mujoco_rl_bed.env.managers.events import event_term
 from mujoco_rl_bed.env.managers.observation import obs_term
 from mujoco_rl_bed.env.managers.reward import reward_term
+from mujoco_rl_bed.env.managers.termination import termination_term
 from mujoco_rl_bed.sim.ik import solve_tcp_ik
 
 if TYPE_CHECKING:
@@ -413,7 +414,11 @@ class SpiralLocal(SpiralResidual):
     `trigger` selects who starts the local phase: "external" (the caller sets the flag), "classifier" (the hole
     trigger, `hole_trigger.HoleTrigger`, on the env's `trigger` observation group, evaluated in the search phase at
     the start of every step) or "oracle" (true peg tip within `trigger_r` [m] of the axis). After a local phase ends
-    the in-env triggers wait `trigger_cool` steps.
+    the in-env triggers wait `trigger_cool` steps (`trigger_enabled = False` switches them off for an episode).
+
+    With `k_yaw_insert` set, the insert phase makes yaw compliant like roll/pitch: the yaw spring drops to
+    `k_yaw_insert` (damping `d_yaw_insert`) and the measured yaw torque acts, so the hole walls can turn a peg that
+    entered slightly yawed instead of jamming it (restored at reset).
 
     Action (3): [a_x, a_y, a_yaw] in [-1, 1].
     """
@@ -442,7 +447,12 @@ class SpiralLocal(SpiralResidual):
         self.trigger_cool = int(p.get("trigger_cool", 25))
         self.trigger_r = float(p.get("trigger_r", 0.001))
         self._since = 10**6
+        self.trigger_enabled = True
         self._hole_trigger = None
+        self.k_yaw_insert = p.get("k_yaw_insert")
+        self.d_yaw_insert = float(p.get("d_yaw_insert", 0.4))
+        c = ctx.controller
+        self._yaw_hold = (float(c.k_rot[2]), float(c.d_rot[2]), float(c.ext_rot_mask[2]))
         if self.trigger_mode == "classifier":
             from compliant_RL.hole_trigger import HoleTrigger
 
@@ -463,7 +473,8 @@ class SpiralLocal(SpiralResidual):
         if self.start_local and st["phase"] == 1 and st["n_local"] == 0:
             st["trigger"] = True
         self._since += 1
-        if st["phase"] == 1 and self.trigger_mode != "external" and self._since > self.trigger_cool:
+        if st["phase"] == 1 and self.trigger_mode != "external" and self.trigger_enabled and \
+                self._since > self.trigger_cool:
             if self._hole_trigger is not None:
                 st["trigger"] |= self._hole_trigger(self.ctx.obs_mgr.compute("trigger"))
             else:
@@ -471,6 +482,7 @@ class SpiralLocal(SpiralResidual):
                 tip = self.ctx.data.site_xpos[fs.peg_tip]
                 st["trigger"] |= math.hypot(tip[0] - fs.hole_tip[0], tip[1] - fs.hole_tip[1]) < self.trigger_r
         if st["phase"] == 1 and st["trigger"]:
+            self._yaw_soft(False)
             st["phase"], st["local_t"] = 3, 0.0
             st["n_local"] += 1
             np.copyto(self._anchor, self._p0 + R[:, :2] @ st["offset"])
@@ -480,6 +492,7 @@ class SpiralLocal(SpiralResidual):
         st["trigger"] = False
         if st["phase"] != 3:
             super().apply(self._zero2)
+            self._yaw_soft(st["phase"] == 2)
             return
         c = self.ctx.controller
         ee = self.ctx.plant.ee_pos
@@ -490,6 +503,7 @@ class SpiralLocal(SpiralResidual):
             st["phase"] = 2
             np.copyto(self._hold, ee)
             self._gains(self.task_gains)
+            self._yaw_soft(True)
             c.set_target(pos=self._hold, f_push=self.f_insert)
             return
         if st["local_t"] >= self.t_local:
@@ -504,8 +518,19 @@ class SpiralLocal(SpiralResidual):
         self._yaw_cmd = st["yaw_cmd"] = float(self._loc[2]) * self.yaw_max
         c.set_target(pos=self._p, f_push=self.f_local, yaw=self._yaw_cmd)
 
+    def _yaw_soft(self, on: bool) -> None:
+        """Compliant yaw (insert phase, if `k_yaw_insert` is set) or the controller's held yaw."""
+        if self.k_yaw_insert is None:
+            return
+        c = self.ctx.controller
+        if on:
+            c.k_rot[2], c.d_rot[2], c.ext_rot_mask[2] = float(self.k_yaw_insert), self.d_yaw_insert, 1.0
+        else:
+            c.k_rot[2], c.d_rot[2], c.ext_rot_mask[2] = self._yaw_hold
+
     def reset(self) -> None:
         """Start the approach (as `spiral_residual`) with no yaw command."""
+        self._yaw_soft(False)
         super().reset()
         self._loc.fill(0.0)
         self._yaw_cmd = 0.0
@@ -615,8 +640,12 @@ def cr_align_hole_yaw(ctx: "Context") -> None:
 
 
 @event_term("cr_hole_yaw_error")
-def cr_hole_yaw_error(ctx: "Context", lo_deg: float = 0.0, hi_deg: float = 10.0, sym_deg: float = 90.0) -> None:
+def cr_hole_yaw_error(ctx: "Context", lo_deg: float = 0.0, hi_deg: float = 10.0, sym_deg: float = 90.0,
+                      bins: tuple = ()) -> None:
     """Reset: turn the socket about the world z axis by U(lo_deg, hi_deg), random sign, from its aligned yaw.
+
+    With `bins` ((lo, hi), ...) [deg] a bin is picked uniformly first, then U(lo, hi) in it (e.g. half the episodes
+    in the range where the peg is blocked).
 
     The aligned yaw is the TCP yaw at home (`cr_align_hole_yaw`, startup; 0 without it). Must run after the socket
     reset (`forge_reset_fixed`). Writes `ctx.state["hole_yaw_err"]` [rad] and the cross-section symmetry
@@ -627,13 +656,50 @@ def cr_hole_yaw_error(ctx: "Context", lo_deg: float = 0.0, hi_deg: float = 10.0,
         lo_deg: Min yaw error magnitude [deg].
         hi_deg: Max yaw error magnitude [deg].
         sym_deg: Rotational symmetry of the cross-section [deg] (90 square, 60 hexagon, 45 octagon).
+        bins: Optional yaw magnitude bins [deg], replacing (lo_deg, hi_deg).
     """
     ctx.state["yaw_sym"] = math.radians(sym_deg)
     st = _st(ctx)
+    if bins:
+        lo_deg, hi_deg = bins[int(ctx.rng.integers(len(bins)))]
     err = math.radians(float(ctx.rng.uniform(lo_deg, hi_deg))) * (1.0 if ctx.rng.uniform() < 0.5 else -1.0)
     yaw = float(ctx.state.get("hole_yaw", 0.0)) + err
     ctx.data.mocap_quat[st.hole_mocap] = (math.cos(0.5 * yaw), 0.0, 0.0, math.sin(0.5 * yaw))
     ctx.state["hole_yaw_err"] = err
+
+
+@event_term("cr_s3_start")
+def cr_s3_start(ctx: "Context", p_local: float = 0.5, local_offset_max: float = 0.0018,
+                spiral_offset_max: float = 0.004, local_episode_s: float = 6.0) -> None:
+    """Reset: per episode either a synthetic local-phase start or the full spiral with the in-env hole trigger.
+
+    Local start (probability `p_local`): tip U(0, local_offset_max) off the hole axis, the local phase starts at
+    touchdown, no trigger, the episode is cut after `local_episode_s` (`cr_s3_local_timeout`). Otherwise: hole
+    estimate U(0, spiral_offset_max) off, spiral + trigger as `compliant_peg_s3_handoff`. Replaces `cr_shift_ee`
+    (same position, after `cr_reset_ee`); needs `spiral_local` with `trigger="classifier"`. Episode metric:
+    `local_start` (1 / 0).
+
+    Args:
+        ctx: Context.
+        p_local: Probability of a synthetic local start.
+        local_offset_max: Max start offset of a local start [m].
+        spiral_offset_max: Max hole-estimate error of a spiral episode [m].
+        local_episode_s: Length of a local-start episode [s].
+    """
+    term = ctx.state["spiral_term"]
+    local = bool(ctx.rng.uniform() < p_local)
+    term.start_local, term.trigger_enabled = local, not local
+    if "s3_start" not in ctx.state:
+        ctx.episode_info_hooks.append(lambda c: {"local_start": 1.0 if c.state["s3_start"]["local"] else 0.0})
+    ctx.state["s3_start"] = {"local": local, "t_end": local_episode_s}
+    cr_shift_ee(ctx, offset_min=0.0, offset_max=local_offset_max if local else spiral_offset_max)
+
+
+@termination_term("cr_s3_local_timeout")
+def cr_s3_local_timeout(ctx: "Context") -> bool:
+    """True once a synthetic local-start episode (`cr_s3_start`) has run its length (use as a time-out)."""
+    s = ctx.state.get("s3_start")
+    return bool(s and s["local"] and ctx.episode_step * ctx.policy_dt >= s["t_end"] - 1e-9)
 
 
 @event_term("cr_shift_ee")

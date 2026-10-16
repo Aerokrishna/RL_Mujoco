@@ -191,3 +191,21 @@ def test_s3_handoff_in_env_trigger_and_spaces_match_s3_local():
                 break
         n_local += sp["n_local"]
     assert n_local >= 1
+
+
+def test_s3_mixed_start_modes():
+    """compliant_peg_s3_mixed: local starts end after 6 s as a time-out; spiral episodes run 20 s with the trigger."""
+    env = make_env("compliant_peg_s3_mixed", {"obs_mode": "asymmetric"})
+    seen = set()
+    for seed in range(8):
+        env.reset(seed=seed)
+        n = 0
+        while True:
+            _, _, term, trunc, info = env.step(np.zeros(3))
+            n += 1
+            if term or trunc:
+                break
+        local = bool(info["local_start"])
+        seen.add(local)
+        assert trunc and abs(n * env.policy_dt - (6.0 if local else 20.0)) < 1e-6
+    assert seen == {True, False}

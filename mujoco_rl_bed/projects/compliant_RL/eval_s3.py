@@ -8,7 +8,7 @@ Methods, all on the same reset seeds (shared hole-error / friction draws from `p
 Conditions: one shape and clearance, hole yaw error exactly each of `yaws` (random sign), hole-estimate error
 U(err), friction U(friction), no tilt. The local policy acts only in the local phase; its LSTM state is reset at
 every local-phase start, or runs through the whole episode with `lstm_continuous` (as in `compliant_peg_s3_handoff`
-training; "auto" picks it from the run's task).
+and `compliant_peg_s3_mixed` training; "auto" picks it from the run's task).
 
 Usage (from `mujoco_rl_bed/`):
     python projects/compliant_RL/eval_s3.py run=<run_folder>
@@ -150,7 +150,7 @@ def run_job(task: tuple) -> tuple:
         continuous = cfg["lstm_continuous"]
         if continuous == "auto":
             task_name = json.loads((run_dir(cfg) / "config.json").read_text())["train"]["task"]
-            continuous = task_name == "compliant_peg_s3_handoff"
+            continuous = task_name in ("compliant_peg_s3_handoff", "compliant_peg_s3_mixed")
     env = make_env("compliant_peg_s3", cfg, yaw)
     ctx = env.ctx
     st, sp = ctx.state["forge"], ctx.state["spiral"]

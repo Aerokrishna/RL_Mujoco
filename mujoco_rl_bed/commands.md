@@ -225,6 +225,19 @@ python -u projects/compliant_RL/train.py task=compliant_peg_s3_handoff init_from
 python projects/compliant_RL/eval_s3.py run=<s3_handoff_run>             # LSTM runs over the whole episode (auto)
 ```
 
+Hand-off-only fine-tuning fixed the trigger hand-offs at 0-6° but forgot the yaw correction at 9° (135/200 vs
+146/200 for the s3_local policy). `compliant_peg_s3_mixed` trains on both start types (50 % synthetic local starts,
+50 % spiral + trigger) with half the yaw errors in the blocked range (6-11°) and a compliant-yaw insert:
+
+```bash
+python -u projects/compliant_RL/train.py task=compliant_peg_s3_mixed init_from=<s3_local_run> device=cuda:1 \
+    n_envs=48 algo=recurrent_ppo asymmetric=true n_steps=128 batch_size=512 n_epochs=4 \
+    learning_rate=1e-4 lr_schedule=adaptive kl_threshold=0.008 gamma=0.99 gae_lambda=0.95 \
+    clip_range=0.2 clip_range_vf=0.2 vf_coef=1.0 ent_coef=0.0 \
+    lstm_hidden_size=256 n_lstm_layers=1 net_arch="(256,128)" activation=elu \
+    total_timesteps=5000000 checkpoint_every=500000 seed=2 run_name=s3_mixed
+```
+
 ## 4. Monitor training
 
 ```bash
