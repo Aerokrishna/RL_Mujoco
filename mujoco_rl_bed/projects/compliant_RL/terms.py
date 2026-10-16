@@ -415,6 +415,7 @@ class SpiralLocal(SpiralResidual):
     trigger, `hole_trigger.HoleTrigger`, on the env's `trigger` observation group, evaluated in the search phase at
     the start of every step) or "oracle" (true peg tip within `trigger_r` [m] of the axis). After a local phase ends
     the in-env triggers wait `trigger_cool` steps (`trigger_enabled = False` switches them off for an episode).
+    `trigger_model` selects the classifier ("" = `hole_trigger.MODEL`, a path, or a file name in `models/`).
 
     With `k_yaw_insert` set, the insert phase makes yaw compliant like roll/pitch: the yaw spring drops to
     `k_yaw_insert` (damping `d_yaw_insert`) and the measured yaw torque acts, so the hole walls can turn a peg that
@@ -456,7 +457,7 @@ class SpiralLocal(SpiralResidual):
         if self.trigger_mode == "classifier":
             from compliant_RL.hole_trigger import HoleTrigger
 
-            self._hole_trigger = HoleTrigger()
+            self._hole_trigger = HoleTrigger(p.get("trigger_model", "") or "")
         self._loc = np.zeros(3)
         self._zero2 = np.zeros(2)
         self._anchor = np.zeros(3)

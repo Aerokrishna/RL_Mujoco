@@ -24,8 +24,17 @@ from pathlib import Path
 
 import numpy as np
 
-MODEL = Path(__file__).resolve().parent / "models" / "hole_trigger_classifier.pkl"
+MODELS = Path(__file__).resolve().parent / "models"
+MODEL = MODELS / "hole_trigger_classifier.pkl"
 ZEROED = slice(16, 21)                   # try state (2) + previous action (3) in the `trigger` group
+
+
+def model_path(name: str | Path = "") -> Path:
+    """A trigger model: "" = the default `MODEL`, an existing path, or a file name in `models/`."""
+    if not str(name):
+        return MODEL
+    p = Path(name)
+    return p if p.is_absolute() or p.exists() else MODELS / p
 
 
 class HoleTrigger:
@@ -44,7 +53,7 @@ class HoleTrigger:
             th: Probability threshold (default: the model's `TH`).
             k: Consecutive steps above it (default: the model's `K`).
         """
-        with open(path, "rb") as f:
+        with open(model_path(path), "rb") as f:
             d = pickle.load(f)
         self.clf, self.w = d["clf"], int(d["W"])
         self.th = float(d["TH"] if th is None else th)

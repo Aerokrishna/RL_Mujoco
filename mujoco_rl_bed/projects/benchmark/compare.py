@@ -1,13 +1,14 @@
-"""Peg-in-hole comparison: spiral search with the scripted catch rule, FORGE and TacDiffusion.
+"""Peg-in-hole comparison: spiral search with the scripted catch rule, FORGE, TacDiffusion and spiral + RL yaw.
 
 All settings live in a YAML config (default `compare.yaml` next to this file); see its comments for every key.
-Every combination of the condition lists (shape x clearance x hole error x tilt x friction) is one condition, and
+Every combination of the condition lists (shape x clearance x hole error x tilt x friction x yaw) is one condition, and
 every method runs the same reset seeds in every condition (common random numbers): socket poses, hole-error
 directions and sizes, tilt directions and sizes and friction draws are identical across methods.
 
 Common to all methods:
 - 8 mm peg (diameter / side / across flats, `peg_half_size_mm`), 25 mm deep hole; non-round holes are turned to the
-  gripper yaw (no yaw error).
+  gripper yaw, then off by the condition's hole yaw error (`conditions.yaw_deg`, default "0"; random sign, shared
+  draws; none for the cylinder).
 - Hole-estimate error in xy (random direction); every method aims at the estimate.
 - Tilt: the arm holds the peg (rigid in the grip) at the tilt angle to the socket normal (random horizontal axis). The
   tilted pose is every method's own nominal "down" orientation, so no method knows the socket is tilted relative to it.
@@ -54,8 +55,10 @@ import yaml
 HERE = Path(__file__).resolve().parent
 PROJECTS = HERE.parent
 BED = PROJECTS.parent                           # .../mujoco_rl_bed (relative paths in the config resolve here)
-NAMES = {"spiral_rule": "Spiral+rule", "forge": "FORGE", "tacdiff": "TacDiff"}
-ORDER = {"tacdiff": 0, "forge": 1, "spiral_rule": 2}   # slowest first (load balance)
+NAMES = {"spiral_rule": "Spiral+rule", "forge": "FORGE", "tacdiff": "TacDiff", "spiral_rl_yaw": "Spiral+RL yaw"}
+ORDER = {"tacdiff": 0, "forge": 1, "spiral_rl_yaw": 2, "spiral_rule": 3}   # slowest first (load balance)
+SYM_DEG = {"cylinder": 90.0, "cuboid": 90.0, "hexagon": 60.0, "octagon": 45.0}   # cross-section symmetry
+SPIRAL_RL_YAW_RUN = "projects/compliant_RL/runs/spiral_RL_yaw"   # default `models.spiral_rl_yaw_run`
 SHAPES = ("cylinder", "cuboid", "hexagon", "octagon")
 
 
@@ -72,6 +75,13 @@ def load_config(argv: list[str]) -> dict:
     args = dict(a.split("=", 1) for a in argv)
     path = Path(args.pop("config", HERE / "compare.yaml"))
     cfg = yaml.safe_load(path.read_text())
+    # Keys added after the first configs were written (older configs get these defaults).
+    cfg["conditions"].setdefault("yaw_deg", ["0"])
+    cfg["models"].setdefault("spiral_rl_yaw_run", SPIRAL_RL_YAW_RUN)
+    cfg.setdefault("spiral_rl_yaw", {})
+    cfg["spiral_rl_yaw"].setdefault("t_local", 6.0)
+    cfg["spiral_rl_yaw"].setdefault("deterministic", True)
+    cfg["spiral_rl_yaw"].setdefault("trigger_model", "")
     for key, raw in args.items():
         node, parts = cfg, key.split(".")
         for p in parts[:-1]:
@@ -112,11 +122,13 @@ def build_conditions(cfg: dict) -> list[dict]:
             for err in c["hole_error_mm"]:
                 for tilt in c["tilt_deg"]:
                     for mu in c["friction"]:
-                        e, t, f = level(err), level(tilt), level(mu)
-                        out.append({"shape": shape, "clearance_mm": float(clr),
-                                    "err": e[0], "err_lo": e[1], "err_hi": e[2],
-                                    "tilt": t[0], "tilt_lo": t[1], "tilt_hi": t[2],
-                                    "friction": f[0], "mu_lo": f[1], "mu_hi": f[2]})
+                        for yaw in c.get("yaw_deg", ["0"]):
+                            e, t, f, y = level(err), level(tilt), level(mu), level(yaw)
+                            out.append({"shape": shape, "clearance_mm": float(clr),
+                                        "err": e[0], "err_lo": e[1], "err_hi": e[2],
+                                        "tilt": t[0], "tilt_lo": t[1], "tilt_hi": t[2],
+                                        "friction": f[0], "mu_lo": f[1], "mu_hi": f[2],
+                                        "yaw": y[0], "yaw_lo": y[1], "yaw_hi": y[2]})
     return out
 
 
@@ -223,6 +235,19 @@ def _register_events() -> None:
             mujoco.mju_quat2Mat(Rn, st.home_quat)
             st.anchor -= st.tcp_to_tip * (Rn.reshape(3, 3)[:, 2] - Rb.reshape(3, 3)[:, 2])
 
+    @event_term("bench_hole_yaw")
+    def bench_hole_yaw(ctx, lo: float = 0.0, hi: float = 0.0, sym: float = 90.0) -> None:
+        """Reset: turn the socket from its aligned yaw by U(lo, hi) deg, random sign (draws shared by all methods).
+
+        Must run after the socket reset and `cr_align_hole_yaw` (startup). Writes `hole_yaw_err` [rad] and `yaw_sym`.
+        """
+        b, st = ctx.state["bench"], ctx.state["forge"]
+        err = math.radians(lo + (hi - lo) * b["yaw_u"]) * (1.0 if b["yaw_s"] < 0.5 else -1.0)
+        yaw = float(ctx.state.get("hole_yaw", 0.0)) + err
+        ctx.data.mocap_quat[st.hole_mocap] = (math.cos(0.5 * yaw), 0.0, 0.0, math.sin(0.5 * yaw))
+        ctx.state["hole_yaw_err"], ctx.state["yaw_sym"] = err, math.radians(sym)
+        b["yaw_applied_deg"] = math.degrees(err)
+
     _register_events.done = True
 
 
@@ -231,7 +256,8 @@ def set_shared(env, seed: int) -> None:
     r = np.random.default_rng(seed + 31337)
     env.ctx.state["bench"] = {"tilt_phi": float(r.uniform(0.0, 2.0 * math.pi)), "tilt_u": float(r.uniform()),
                               "err_phi": float(r.uniform(0.0, 2.0 * math.pi)), "err_u": float(r.uniform()),
-                              "mu_u": float(r.uniform()), "paper_u": r.uniform(size=5)}
+                              "mu_u": float(r.uniform()), "paper_u": r.uniform(size=5),
+                              "yaw_u": float(r.uniform()), "yaw_s": float(r.uniform())}
 
 
 def patch_task(task, cond: dict, cfg: dict, replace: str | None = None, fix_anchor: bool = True) -> None:
@@ -255,8 +281,10 @@ def patch_task(task, cond: dict, cfg: dict, replace: str | None = None, fix_anch
         tilt.append(E(mode="reset", func="bench_paper_error", params={
             "tol_xy": 1e-3 * float(pe["tol_mm"]), "tol_deg": float(pe["tol_deg"]), "fix_anchor": fix_anchor}))
     events = {}
+    bench_yaw = "yaw_hi" in cond                      # the benchmark owns the hole yaw (else keep the task's own event)
+    yaw = bench_yaw and cond["yaw_hi"] > 0.0 and cond["shape"] != "cylinder"
     for k, v in task.events.items():
-        if k in ("tilt_ee", "shift_ee"):
+        if k in ("tilt_ee", "shift_ee") or (k == "hole_yaw_error" and bench_yaw):
             continue
         if k == "randomize_friction":
             events["friction"] = E(mode="reset", func="bench_friction", params={"lo": cond["mu_lo"], "hi": cond["mu_hi"]})
@@ -270,6 +298,9 @@ def patch_task(task, cond: dict, cfg: dict, replace: str | None = None, fix_anch
             v.params.update({"pos_noise_std": 0.0, "pos_noise_xy": 0.0})
             events["hole_error"] = E(mode="reset", func="bench_hole_error",
                                      params={"lo": 1e-3 * cond["err_lo"], "hi": 1e-3 * cond["err_hi"]})
+            if yaw:
+                events["hole_yaw"] = E(mode="reset", func="bench_hole_yaw",
+                                       params={"lo": cond["yaw_lo"], "hi": cond["yaw_hi"], "sym": SYM_DEG[cond["shape"]]})
         if k == "init" and cond["shape"] != "cylinder":
             events["align_hole_yaw"] = E(mode="startup", func="cr_align_hole_yaw")
     task.events = events
@@ -332,8 +363,31 @@ def make_spiral_env(cond: dict, cfg: dict):
     s = cfg["spiral"]
     ecfg = make_env_cfg("compliant_peg_s2g", {"task.episode_length_s": str(float(cfg["time_max"]) + 1.0),
                                               "obs_mode": "asymmetric", **_view_ov(cfg)})
+    if s.get("k_lat") is not None:                    # try/insert lateral spring (configs without the key: 200 N/m)
+        ecfg.task.controller.k_lat = float(s["k_lat"])
+    for key in ("ks_tilt", "ds_tilt"):                # search roll/pitch spring / damper (configs without: 3 / 1.5)
+        if s.get(key) is not None:
+            ecfg.task.action.params[key] = float(s[key])
     ecfg.task.action.params.update({"f_search": float(s["f_search_n"]), "pitch": 1e-3 * float(s["pitch_mm"]),
                                     "r_max": 1e-3 * float(s["r_max_mm"]), "v": 1e-3 * float(s["speed_mm_s"])})
+    patch_task(ecfg.task, cond, cfg, replace="randomize_grasp")
+    ecfg.task.events["reset_ee"].params["xy_jitter"] = 0.0
+    return TorqueEnv(ecfg)
+
+
+def make_s3_env(cond: dict, cfg: dict):
+    """`compliant_peg_s3` (spiral + in-env hole trigger + local x, y, yaw phase) with the condition."""
+    import compliant_RL  # noqa: F401
+    from mujoco_rl_bed.env.torque_env import TorqueEnv
+    from mujoco_rl_bed.tasks.registry import make_env_cfg
+
+    s, r = cfg["spiral"], cfg.get("spiral_rl_yaw", {})
+    ecfg = make_env_cfg("compliant_peg_s3", {"task.episode_length_s": str(float(cfg["time_max"]) + 1.0),
+                                             "obs_mode": "asymmetric", **_view_ov(cfg)})
+    ecfg.task.action.params.update({"f_search": float(s["f_search_n"]), "pitch": 1e-3 * float(s["pitch_mm"]),
+                                    "r_max": 1e-3 * float(s["r_max_mm"]), "v": 1e-3 * float(s["speed_mm_s"]),
+                                    "trigger": "classifier", "t_local": float(r.get("t_local", 6.0)),
+                                    "trigger_model": str(r.get("trigger_model", "") or "")})
     patch_task(ecfg.task, cond, cfg, replace="randomize_grasp")
     ecfg.task.events["reset_ee"].params["xy_jitter"] = 0.0
     return TorqueEnv(ecfg)
@@ -395,7 +449,8 @@ class Recorder:
                 "f_max": float(f50.max()), "f_peak": float(f.max()), "f_mean": float(f.mean()),
                 "outcome": "success" if ok else "unstable" if unstable else "jammed" if self.entered else "not_found",
                 "min_xy_mm": 1e3 * self.min_xy, "err_mm": b.get("err_applied_mm", float("nan")),
-                "tilt_deg": b.get("tilt_applied_deg", float("nan")), "friction": float(self.st.friction)}
+                "tilt_deg": b.get("tilt_applied_deg", float("nan")), "friction": float(self.st.friction),
+                "yaw_deg": b.get("yaw_applied_deg", 0.0)}
 
 
 # ---------------------------------------------------------------------------------- policies
@@ -518,7 +573,36 @@ def job_tacdiff(cond: dict, seeds: list[int], cfg: dict, method: str = "tacdiff"
     return rows
 
 
-JOBS = {"spiral_rule": job_spiral_rule, "forge": job_forge, "tacdiff": job_tacdiff}
+def job_spiral_rl_yaw(cond: dict, seeds: list[int], cfg: dict, method: str = "spiral_rl_yaw") -> list[dict]:
+    """Spiral + hole trigger + learned local x, y, yaw policy (`models.spiral_rl_yaw_run`, a compliant_peg_s3_mixed run).
+
+    The policy's LSTM runs through the whole episode (as in its training); its action is used in the local phase only.
+    """
+    import torch
+
+    model, mean, std, clip = _load_sb3(path_of(cfg["models"].get("spiral_rl_yaw_run", SPIRAL_RL_YAW_RUN)))
+    env = make_s3_env(cond, cfg)
+    sp = env.ctx.state["spiral"]
+    det = bool(cfg.get("spiral_rl_yaw", {}).get("deterministic", True))
+    mem = {}
+
+    def reset(seed):
+        torch.manual_seed(seed)
+        mem.update(state=None, start=np.ones((1,), dtype=bool))
+
+    def act(o):
+        x = np.clip((o - mean) / std, -clip, clip).astype(np.float32)
+        a, mem["state"] = model.predict(x[None], state=mem["state"], episode_start=mem["start"], deterministic=det)
+        mem["start"] = np.zeros((1,), dtype=bool)
+        return a[0] if sp["phase"] == 3 else np.zeros(3)
+
+    try:
+        return _episodes(env, seeds, cfg, act, reset)
+    finally:
+        _close(env, cfg)
+
+
+JOBS = {"spiral_rule": job_spiral_rule, "forge": job_forge, "tacdiff": job_tacdiff, "spiral_rl_yaw": job_spiral_rl_yaw}
 
 
 def _after_episode(env, rows: list[dict], cfg: dict) -> bool:
@@ -550,7 +634,7 @@ def run_job(task: tuple) -> tuple:
     t0 = time.perf_counter()
     rows = JOBS[method](cond, seeds, cfg, method)
     for r in rows:
-        r.update(method=method, cond=ci, **{k: cond[k] for k in ("shape", "clearance_mm", "err", "tilt")},
+        r.update(method=method, cond=ci, **{k: cond[k] for k in ("shape", "clearance_mm", "err", "tilt", "yaw")},
                  friction_level=cond["friction"])
     return method, ci, rows, time.perf_counter() - t0
 
@@ -574,13 +658,13 @@ def wilson(k: int, n: int, z: float = 1.96) -> tuple[float, float]:
 
 def summarize(rows: list[dict], methods: list[str], conds: list[dict]) -> tuple[list[str], list[list[str]]]:
     """Per condition and method: success (95% CI), median time to success, median F_max, failure split."""
-    header = ["#", "shape", "clearance/side [mm]", "hole error [mm]", "tilt [deg]", "friction"]
+    header = ["#", "shape", "clearance/side [mm]", "hole error [mm]", "tilt [deg]", "friction", "yaw [deg]"]
     for m in methods:
         n = NAMES[m]
         header += [f"{n} success (95% CI)", f"{n} time [s]", f"{n} F_max [N]", f"{n} fails: not found / jammed"]
     table = []
     for ci, c in enumerate(conds):
-        line = [str(ci + 1), c["shape"], f"{c['clearance_mm']:g}", c["err"], c["tilt"], c["friction"]]
+        line = [str(ci + 1), c["shape"], f"{c['clearance_mm']:g}", c["err"], c["tilt"], c["friction"], c["yaw"]]
         for m in methods:
             rs = [r for r in rows if r["method"] == m and r["cond"] == ci]
             n, k = len(rs), sum(r["success"] for r in rs)
@@ -621,7 +705,7 @@ def view(cfg: dict, conds: list[dict], seeds: list[int]) -> None:
         raise ValueError(f"view.method must be one of {list(NAMES)}")
     for ci, c in enumerate(conds):
         print(f"{NAMES[method]} | condition {ci + 1}/{len(conds)}: {c['shape']}, clearance {c['clearance_mm']:g} mm, "
-              f"hole error {c['err']} mm, tilt {c['tilt']}°, friction {c['friction']}", flush=True)
+              f"hole error {c['err']} mm, tilt {c['tilt']}°, friction {c['friction']}, yaw {c['yaw']}°", flush=True)
         try:
             rows = JOBS[method](c, seeds, cfg, method)
         except KeyboardInterrupt:                           # the job has already closed the viewer
@@ -664,7 +748,7 @@ def main(argv: list[str]) -> None:
             rows += rs
             c = conds[ci]
             print(f"[{i + 1:3d}/{len(tasks)}] {NAMES[method]:11s} #{ci + 1:2d} {c['shape']:8s} clr {c['clearance_mm']:g} "
-                  f"err {c['err']} tilt {c['tilt']} mu {c['friction']}: {sum(r['success'] for r in rs)}/{len(rs)}  "
+                  f"err {c['err']} tilt {c['tilt']} mu {c['friction']} yaw {c['yaw']}: {sum(r['success'] for r in rs)}/{len(rs)}  "
                   f"({wall:.0f} s, elapsed {time.perf_counter() - t0:.0f} s)", flush=True)
     print("\n" + write_summary(out, rows, methods, conds))
     print(f"\n{len(rows)} episodes -> {out}")

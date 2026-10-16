@@ -6,7 +6,7 @@ Methods, all on the same reset seeds (shared hole-error / friction draws from `p
     trigger_policy   spiral -> hole trigger -> trained local policy (`run`)
     perfect_policy   spiral -> privileged trigger (true tip within 1 mm) -> trained local policy
 Conditions: one shape and clearance, hole yaw error exactly each of `yaws` (random sign), hole-estimate error
-U(err), friction U(friction), no tilt. The local policy acts only in the local phase; its LSTM state is reset at
+U(err), friction U(friction), arm tilt U(tilt) (default none). The local policy acts only in the local phase; its LSTM state is reset at
 every local-phase start, or runs through the whole episode with `lstm_continuous` (as in `compliant_peg_s3_handoff`
 and `compliant_peg_s3_mixed` training; "auto" picks it from the run's task).
 
@@ -50,9 +50,11 @@ DEFAULTS = {
     "clearance_mm": 0.5,
     "err": "0-4",                    # hole-estimate error [mm]: "a" or "a-b"
     "friction": "0.5-1.0",
+    "tilt": "0",                     # arm tilt against the socket normal [deg]: "a" or "a-b" (random axis)
     "time_max": 20.0,                # [s] per episode
     "t_local": 6.0,                  # [s] per local phase before the spiral resumes
     "deterministic": True,           # policy mean (False: sampled actions)
+    "trigger_model": "",             # hole-trigger model: "" = default, a path, or a file name in models/
     "lstm_continuous": "auto",       # True: LSTM over the whole episode; False: reset per local phase; "auto": by task
     "workers": 5,
     "out": "",
@@ -80,9 +82,9 @@ def bench(cfg: dict) -> tuple[dict, dict]:
     """compare.py condition and config dicts for the episode loop and `patch_task`."""
     from compare import level
 
-    e, f = level(cfg["err"]), level(cfg["friction"])
+    e, f, t = level(cfg["err"]), level(cfg["friction"]), level(cfg["tilt"])
     cond = {"shape": cfg["shape"], "clearance_mm": float(cfg["clearance_mm"]), "err": e[0], "err_lo": e[1],
-            "err_hi": e[2], "tilt": "0", "tilt_lo": 0.0, "tilt_hi": 0.0, "friction": f[0], "mu_lo": f[1], "mu_hi": f[2]}
+            "err_hi": e[2], "tilt": t[0], "tilt_lo": t[1], "tilt_hi": t[2], "friction": f[0], "mu_lo": f[1], "mu_hi": f[2]}
     bcfg = {"time_max": float(cfg["time_max"]), "peg_half_size_mm": 4.0, "paper_error": {"enabled": False},
             "spiral": {"f_search_n": 1.5, "pitch_mm": 0.8, "r_max_mm": 4.6, "speed_mm_s": 10.0},
             "view": {"enabled": False, "realtime": False, "pause_s": 0.0}}
@@ -112,6 +114,7 @@ def make_env(task: str, cfg: dict, yaw: float):
                                     "r_max": 1e-3 * s["r_max_mm"], "v": 1e-3 * s["speed_mm_s"]})
     if task == "compliant_peg_s3":
         ecfg.task.action.params["t_local"] = float(cfg["t_local"])
+        ecfg.task.action.params["trigger_model"] = cfg["trigger_model"]
     C.patch_task(ecfg.task, cond, bcfg, replace="randomize_grasp")
     ecfg.task.events["reset_ee"].params["xy_jitter"] = 0.0
     return TorqueEnv(ecfg)
@@ -155,7 +158,7 @@ def run_job(task: tuple) -> tuple:
     ctx = env.ctx
     st, sp = ctx.state["forge"], ctx.state["spiral"]
     orc = None if uses_policy else LocalOracle(env, sym_deg=SYM[cfg["shape"]])
-    trig = HoleTrigger() if method.startswith("trigger") else None
+    trig = HoleTrigger(cfg["trigger_model"]) if method.startswith("trigger") else None
     mem: dict = {}
     hand: list[list[dict]] = []
 
@@ -209,7 +212,7 @@ def run_job(task: tuple) -> tuple:
 def summarize(res: dict, cfg: dict) -> str:
     yaws, methods = cfg["yaws"], cfg["methods"]
     n = int(cfg["episodes"])
-    L = [f"## {cfg['shape']}, {cfg['clearance_mm']:g} mm clearance, hole error U({cfg['err']}) mm, friction "
+    L = [f"## {cfg['shape']}, {cfg['clearance_mm']:g} mm clearance, hole error U({cfg['err']}) mm, tilt {cfg['tilt']}°, friction "
          f"U({cfg['friction']}), {n} episodes per cell (seeds {cfg['seed']}+), {cfg['time_max']:g} s; run "
          f"`{cfg['run'] or '-'}` ({cfg['checkpoint']}, {'deterministic' if cfg['deterministic'] else 'sampled'}, "
          f"local phase {cfg['t_local']:g} s, LSTM {cfg['lstm_continuous']})", "",
