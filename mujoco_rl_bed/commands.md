@@ -123,6 +123,7 @@ Pick `n_envs` from `scripts/system_check.py` (simulation runs in CPU processes; 
 ... task.events.reset_fixed.params.pos_noise_std=0.0025       # paper's 2.5 mm hole-pose noise
 ... task.scene.assets.1.inner_radius=0.0045                   # 0.5 mm radial clearance (jitter_but_works)
 ... task.rewards.contact_penalty.weight=-0.1                  # softer force penalty
+... task=forge_peg_cuboid                                     # 8 mm square peg, 0.5 mm radial clearance, no hand yaw
 python projects/forge/train.py algo=ppo n_envs=4 total_timesteps=20000 run_name=smoke   # 1-minute smoke run
 ```
 

@@ -37,7 +37,7 @@ from __future__ import annotations
 from mujoco_rl_bed.control.cartesian_impedance import CartesianImpedanceCfg
 from mujoco_rl_bed.env.cfg import (ActionCfg, EventTermCfg, ObsCfg, ObsTermCfg, RewardTermCfg, TaskCfg,
                                    TerminationTermCfg)
-from mujoco_rl_bed.sim.assets import Peg, RoundHole
+from mujoco_rl_bed.sim.assets import BoxPeg, Peg, RectHole, RoundHole
 from mujoco_rl_bed.sim.scene import SceneCfg
 from mujoco_rl_bed.tasks.registry import register_task
 
@@ -164,3 +164,27 @@ def forge_peg() -> TaskCfg:
         episode_length_s=9.9,               # 150 policy steps at 15.15 Hz
         env_defaults={"decimation": 33},    # 2 ms x 33 = 66 ms policy step (paper: 15 Hz)
     )
+
+
+@register_task("forge_peg_cuboid")
+def forge_peg_cuboid() -> TaskCfg:
+    """`forge_peg` with an 8 mm square peg in a square hole (0.5 mm radial clearance per side).
+
+    The hole is turned to the gripper's home yaw (`forge_align_hole_yaw`) and the hand yaw is not randomized:
+    the action has no yaw, so a peg yawed against the hole could never enter. Everything else (randomization,
+    noise, rewards) is `forge_peg`. Clearance: `task.scene.assets.1.inner_half_x=...` and `inner_half_y=...`.
+
+    Returns:
+        A new `TaskCfg`.
+    """
+    cfg = forge_peg()
+    cfg.scene.assets = [BoxPeg(name="peg", half_x=0.004, half_y=0.004),
+                        RectHole(name="hole", inner_half_x=0.0045, inner_half_y=0.0045)]
+    events = {}
+    for k, v in cfg.events.items():
+        events[k] = v
+        if k == "init":
+            events["align_hole_yaw"] = EventTermCfg(mode="startup", func="forge_align_hole_yaw")
+    events["reset_ee"].params["yaw_range"] = 0.0
+    cfg.events = events
+    return cfg

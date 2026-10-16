@@ -331,3 +331,24 @@ def test_exact_horizontal_hole_error() -> None:
         assert np.hypot(err[0], err[1]) == pytest.approx(0.003, abs=1e-6) and err[2] == pytest.approx(0.0, abs=1e-7)
         dirs.append(np.arctan2(err[1], err[0]))
     assert np.ptp(dirs) > 0.5
+
+
+@pytest.mark.parametrize("seed", [0, 1])
+def test_cuboid_task_aligned_and_insertable(seed: int) -> None:
+    """forge_peg_cuboid: box peg, hole turned to the TCP yaw, and the scripted expert inserts (0.5 mm clearance)."""
+    import mujoco
+
+    env = make_env("forge_peg_cuboid", NO_DR)
+    ctx = env.unwrapped.ctx
+    g = mujoco.mj_name2id(ctx.model, mujoco.mjtObj.mjOBJ_GEOM, "peg_geom")
+    assert ctx.model.geom_type[g] == mujoco.mjtGeom.mjGEOM_BOX
+    pol = ScriptedPegInsert(env)
+    obs, _ = env.reset(seed=seed)
+    R = ctx.plant.ee_quat()
+    tcp_yaw = np.arctan2(2 * (R[0] * R[3] + R[1] * R[2]), 1 - 2 * (R[2] ** 2 + R[3] ** 2))
+    assert np.cos(tcp_yaw - ctx.state["hole_yaw"]) == pytest.approx(1.0, abs=1e-4)
+    while True:
+        obs, _, te, tr, info = env.step(pol(obs))
+        if te or tr:
+            break
+    assert info["is_success"]

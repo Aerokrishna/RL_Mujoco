@@ -352,6 +352,28 @@ def forge_init(ctx: "Context", peg: str = "peg", hole: str = "hole", place_xy: f
     ctx.episode_info_hooks.append(st.episode_info)
 
 
+@event_term("forge_align_hole_yaw")
+def forge_align_hole_yaw(ctx: "Context") -> None:
+    """Startup: rotate the socket about the world z axis to the TCP yaw at home (yaw is held by the controller).
+
+    For non-round parts (`BoxPeg` / `RectHole`): the peg's cross-section axes are the TCP x, y axes, so the hole
+    is turned to match them. Sets the mocap body's default orientation, which `mj_resetData` restores every reset.
+    Must run after `forge_init`.
+
+    Args:
+        ctx: Context.
+    """
+    st = _st(ctx)
+    R = np.zeros(9)
+    mujoco.mju_quat2Mat(R, st.home_quat)
+    yaw = math.atan2(R[3], R[0])                      # TCP x axis in the world xy plane
+    q = np.array([math.cos(0.5 * yaw), 0.0, 0.0, math.sin(0.5 * yaw)])
+    hole_body = int(np.flatnonzero(ctx.model.body_mocapid == st.hole_mocap)[0])
+    ctx.model.body_quat[hole_body] = q
+    ctx.data.mocap_quat[st.hole_mocap] = q
+    ctx.state["hole_yaw"] = yaw
+
+
 @event_term("forge_reset_fixed")
 def forge_reset_fixed(ctx: "Context", lo: tuple[float, float, float] = (0.55, -0.05, 0.0),
                       hi: tuple[float, float, float] = (0.65, 0.05, 0.1), pos_noise_std: float = 0.0,
