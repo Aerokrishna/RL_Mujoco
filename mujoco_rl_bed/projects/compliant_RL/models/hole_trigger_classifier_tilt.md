@@ -17,3 +17,9 @@ Hole trigger `hole_trigger_classifier_tilt.pkl`: p > 0.85 for 3 steps; config {'
 | yaw 4-8 deg (non-round) | 389 | 0.86 | 0.62 / 0.17 | 0.77 / 1.24 | 0.52 / 0.17 |
 | yaw 8-max deg (non-round) | 403 | 0.84 | 0.49 / 0.24 | 0.65 / 1.26 | 0.44 / 0.22 |
 | all | 1561 | 0.83 | 0.69 / 0.15 | 0.77 / 1.04 | 0.56 / 0.17 |
+
+Firing rule changed after training to p > 0.7 for 3 steps (the selected 0.85 / 3 missed most no-tilt large-yaw
+holes). End to end, trigger -> oracle (cuboid 0.5 mm, xy error 0-4 mm, seeds 2000+, 50 per cell), old trigger vs this:
+tilt 0-5 deg, yaw 0-6 deg: 260 vs 332/350; no tilt, yaw 0/3/6/9 deg: 187 vs 190/200 (0.85 / 3: 142/200).
+Sweep at tilt 0-5 yaw 0/6 | no tilt yaw 6/9 (/100 each): 0.85/3 94 | 44, 0.9/1 98 | 47, 0.95/1 96 | 42,
+0.85/2 96 | 45, 0.7/3 96 | 92.
