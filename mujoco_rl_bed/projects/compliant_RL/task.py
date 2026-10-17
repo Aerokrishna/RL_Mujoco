@@ -577,3 +577,30 @@ def compliant_peg_s3_mixed() -> TaskCfg:
     cfg.events["hole_yaw_error"].params["bins"] = ((0.0, 6.0), (6.0, 11.0))
     cfg.terminations["local_timeout"] = TerminationTermCfg(func="cr_s3_local_timeout", time_out=True)
     return cfg
+
+
+@register_task("compliant_peg_s3_mixed_tilt")
+def compliant_peg_s3_mixed_tilt() -> TaskCfg:
+    """`compliant_peg_s3_mixed` with arm tilt and the tilt-aware hole trigger.
+
+    - Arm tilt (`cr_arm_tilt`, as the benchmark's and `eval_s3.py`'s `tilt`): in half the episodes the arm holds the
+      peg tilted U(0, 5°) against the socket plane, else straight down. The untilted half and the yaw over-sampling
+      keep the no-tilt yaw correction covered.
+    - Hole trigger `models/hole_trigger_classifier_tilt.pkl` (trained with the same tilt in half the conditions),
+      so the spiral episodes hand over the states the tilt trigger produces.
+    - Fine-tune a `compliant_peg_s3_mixed` run with `init_from`; evaluate with
+      `eval_s3.py trigger_model=hole_trigger_classifier_tilt.pkl`, with and without `tilt=0-5`.
+
+    Returns:
+        A new `TaskCfg`.
+    """
+    cfg = compliant_peg_s3_mixed()
+    cfg.action.params["trigger_model"] = "hole_trigger_classifier_tilt.pkl"
+    events = {}
+    for k, v in cfg.events.items():
+        if k == "reset_ee":
+            events["arm_tilt"] = EventTermCfg(mode="reset", func="cr_arm_tilt",
+                                              params={"tilt_max_deg": 5.0, "p_tilt": 0.5})
+        events[k] = v
+    cfg.events = events
+    return cfg

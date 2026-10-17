@@ -803,6 +803,39 @@ def cr_tilt_ee(ctx: "Context", tilt_max_deg: float = 10.0, ik_tol: float = 1e-3,
     st.ik_err_max = max(st.ik_err_max, err if err > ik_tol else 0.0)
 
 
+@event_term("cr_arm_tilt")
+def cr_arm_tilt(ctx: "Context", tilt_max_deg: float = 5.0, p_tilt: float = 0.5, fix_anchor: bool = True) -> None:
+    """Reset: the arm holds the peg tilted against the socket plane, as the benchmark's `bench_arm_tilt`.
+
+    With probability `p_tilt` the nominal "gripper down" orientation (`ForgeState.home_quat`) is tilted by
+    U(0, tilt_max_deg) about a random horizontal axis, else it stays down. Every controller takes it as its own
+    reference, so the tilt is not corrected (unlike `cr_tilt_ee`, which only tilts the start pose). With `fix_anchor`
+    the anchor is corrected so the peg tip, not the TCP, aims at the estimate. Must run after `forge_reset_fixed` and
+    before `cr_reset_ee`. Writes `ctx.state["arm_tilt_deg"]`.
+
+    Args:
+        ctx: Context.
+        tilt_max_deg: Max tilt magnitude [deg].
+        p_tilt: Probability of a tilted episode.
+        fix_anchor: Correct the anchor for the tilt.
+    """
+    st = _st(ctx)
+    if "arm_tilt_home0" not in ctx.state:
+        ctx.state["arm_tilt_home0"] = st.home_quat.copy()
+    ang = math.radians(tilt_max_deg * float(ctx.rng.uniform())) if ctx.rng.uniform() < p_tilt else 0.0
+    phi = float(ctx.rng.uniform(0.0, 2.0 * math.pi))
+    qt = np.array([1.0, 0.0, 0.0, 0.0])
+    if ang > 0.0:
+        mujoco.mju_axisAngle2Quat(qt, np.array([math.cos(phi), math.sin(phi), 0.0]), ang)
+    mujoco.mju_mulQuat(st.home_quat, qt, ctx.state["arm_tilt_home0"])
+    mujoco.mju_negQuat(st.home_quat_inv, st.home_quat)
+    ctx.state["arm_tilt_deg"] = math.degrees(ang)
+    if fix_anchor and ang > 0.0:
+        Rt = np.zeros(9)
+        mujoco.mju_quat2Mat(Rt, qt)
+        st.anchor += st.tcp_to_tip * (Rt.reshape(3, 3)[:, 2] - np.array([0.0, 0.0, 1.0]))
+
+
 # ---------------------------------------------------------------------------------- observations
 def _tcp_R(ctx: "Context") -> np.ndarray:
     """TCP rotation (TCP -> world), shape (3, 3) (a view of site_xmat).
